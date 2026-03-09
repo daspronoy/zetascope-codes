@@ -1,4 +1,4 @@
-/**
+f/**
  * Full-Scale Brute-Force TBD Benchmark
  * =====================================
  * 10 megapixel images, ~20K velocity hypotheses, 300 frames
@@ -214,7 +214,7 @@ int main() {
     printf("GPU: %s (SM %d.%d, %d SMs, %.1f GB VRAM)\n",
            prop.name, prop.major, prop.minor,
            prop.multiProcessorCount,
-           prop.totalGlobalMem / 1e9);
+           prop.totalGlobalMem / 1e9);s
     printf("L2 cache: %.1f MB\n\n", prop.l2CacheSize / 1e6);
 
     // --- Build velocity grid ---
