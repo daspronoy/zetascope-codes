@@ -1,0 +1,643 @@
+\documentclass[11pt,letterpaper]{article}
+
+% ── Packages ──────────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usepackage{tcolorbox}
+\usepackage{caption}
+
+\tcbuselibrary{listings,skins,breakable}
+
+% ── Colors ────────────────────────────────────────────────────
+\definecolor{zetablue}{RGB}{30,70,130}
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codeborder}{RGB}{200,200,200}
+\definecolor{keywordblue}{RGB}{0,0,180}
+\definecolor{commentgreen}{RGB}{0,128,0}
+\definecolor{stringred}{RGB}{163,21,21}
+\definecolor{warnred}{RGB}{180,30,30}
+\definecolor{notebg}{RGB}{240,248,255}
+\definecolor{warnbg}{RGB}{255,245,238}
+
+% ── Hyperref ──────────────────────────────────────────────────
+\hypersetup{
+    colorlinks=true,
+    linkcolor=zetablue,
+    citecolor=zetablue,
+    urlcolor=zetablue,
+}
+
+% ── Code listings ─────────────────────────────────────────────
+\lstdefinestyle{pythonstyle}{
+    language=Python,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{keywordblue}\bfseries,
+    commentstyle=\color{commentgreen}\itshape,
+    stringstyle=\color{stringred},
+    backgroundcolor=\color{codebg},
+    frame=single,
+    rulecolor=\color{codeborder},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    numbersep=8pt,
+    tabsize=4,
+    showstringspaces=false,
+    breaklines=true,
+    xleftmargin=2em,
+    framexleftmargin=1.5em,
+}
+
+\lstdefinestyle{cudastyle}{
+    language=C++,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{keywordblue}\bfseries,
+    commentstyle=\color{commentgreen}\itshape,
+    stringstyle=\color{stringred},
+    backgroundcolor=\color{codebg},
+    frame=single,
+    rulecolor=\color{codeborder},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    numbersep=8pt,
+    tabsize=4,
+    showstringspaces=false,
+    breaklines=true,
+    xleftmargin=2em,
+    framexleftmargin=1.5em,
+    morekeywords={__global__,__device__,__shared__,__constant__,__ldg,
+                  dim3,cudaMalloc,cudaFree,cudaMemcpy,cudaMemcpyToSymbol,
+                  cudaDeviceSynchronize,cudaEventCreate,cudaEventRecord,
+                  cudaEventSynchronize,cudaEventElapsedTime,blockIdx,
+                  blockDim,threadIdx,gridDim,float2,float4,int2},
+}
+
+% ── Header/Footer ─────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textcolor{zetablue}{\textbf{Zetascope}} --- GPU Engineer Interview}
+\fancyhead[R]{\small\textcolor{gray}{Confidential}}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% ── Custom boxes ──────────────────────────────────────────────
+\newtcolorbox{notebox}[1][]{
+    colback=notebg,
+    colframe=zetablue,
+    fonttitle=\bfseries,
+    title={#1},
+    arc=2pt,
+    boxrule=0.5pt,
+    left=8pt, right=8pt, top=4pt, bottom=4pt,
+}
+
+\newtcolorbox{warnbox}[1][]{
+    colback=warnbg,
+    colframe=warnred,
+    fonttitle=\bfseries\color{warnred},
+    title={#1},
+    arc=2pt,
+    boxrule=0.5pt,
+    left=8pt, right=8pt, top=4pt, bottom=4pt,
+}
+
+% ── Title ─────────────────────────────────────────────────────
+\title{%
+    \vspace{-1cm}
+    {\Large\textcolor{zetablue}{\textbf{Zetascope, Inc.}}}\\[0.3cm]
+    {\LARGE GPU Engineer Technical Interview}\\[0.2cm]
+    {\Large Brute-Force Track-Before-Detect on CUDA}\\[0.3cm]
+    \rule{\textwidth}{0.4pt}
+}
+\author{}
+\date{\today}
+
+% ==============================================================
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+% ──────────────────────────────────────────────────────────────
+\section{Introduction}
+% ──────────────────────────────────────────────────────────────
+
+\subsection{Background}
+
+Track-Before-Detect (TBD) is a signal processing paradigm for detecting
+objects that are too faint to observe in any single measurement. Instead
+of detecting first and tracking second (the classical approach), TBD
+accumulates evidence across many measurements along candidate motion
+hypotheses, exploiting the fact that signal grows as $\mathcal{O}(N)$
+while noise grows as $\mathcal{O}(\sqrt{N})$ for $N$ integrated frames.
+
+In the context of \textbf{space domain awareness}, TBD enables detection
+of extremely faint resident space objects (RSOs) at cislunar distances,
+where the object may contribute only a handful of photons per frame
+against a noisy background.
+
+\subsection{The Shift-and-Stack Algorithm}
+
+The simplest TBD method is \textbf{brute-force shift-and-stack}: for every
+candidate trajectory defined by a starting pixel position $(x_0, y_0)$ and
+constant velocity $(v_x, v_y)$, sum the pixel values along the predicted
+path across all frames. The trajectory producing the highest sum (the
+\emph{test statistic}) is the detection.
+
+Formally, given a sequence of $N$ frames $\{I_t\}_{t=0}^{N-1}$, the
+test statistic is:
+\begin{equation}
+    \boxed{
+    T(x_0, y_0, v_x, v_y)
+    \;=\;
+    \sum_{t=0}^{N-1} I_t\!\left[\,
+        \mathrm{round}(y_0 + v_y \cdot t),\;
+        \mathrm{round}(x_0 + v_x \cdot t)
+    \,\right]
+    }
+    \label{eq:test_stat}
+\end{equation}
+
+\noindent where $I_t[r, c]$ denotes the pixel value at row $r$, column $c$
+of frame $t$. The detection is:
+\begin{equation}
+    (\hat{x}_0,\, \hat{y}_0,\, \hat{v}_x,\, \hat{v}_y)
+    \;=\;
+    \arg\max_{(x_0, y_0, v_x, v_y)} \; T(x_0, y_0, v_x, v_y)
+    \label{eq:detection}
+\end{equation}
+
+\begin{notebox}[Why Brute-Force?]
+While more sophisticated algorithms (temporal-velocity pyramids, FFT-based
+methods, multi-resolution search) exist to accelerate TBD, the brute-force
+approach is the \emph{gold standard} baseline: it is exact, trivially
+parallelizable, and serves as the correctness reference for all optimized
+methods. Understanding how to efficiently map this embarrassingly parallel
+problem onto GPU hardware is a fundamental skill.
+\end{notebox}
+
+% ──────────────────────────────────────────────────────────────
+\section{Problem Specification}
+\label{sec:problem}
+% ──────────────────────────────────────────────────────────────
+
+\subsection{Synthetic Data Model}
+
+Each frame is generated as independent Poisson noise with a faint moving
+point source injected along a ground-truth trajectory:
+\begin{equation}
+    I_t[r, c] \;\sim\;
+    \mathrm{Poisson}\!\left(\lambda_{\mathrm{bg}}\right)
+    + \delta_{r, r_t}\,\delta_{c, c_t}\,
+      \mathrm{Poisson}\!\left(\lambda_{\mathrm{obj}}\right)
+    \label{eq:data_model}
+\end{equation}
+where $(c_t, r_t) = \bigl(\mathrm{round}(x_0^* + v_x^* t),\;
+\mathrm{round}(y_0^* + v_y^* t)\bigr)$ is the true object position at frame $t$.
+
+\subsection{Problem Parameters}
+
+Table~\ref{tab:params} lists all fixed parameters for this exercise.
+
+\begin{table}[h]
+\centering
+\caption{Problem parameters.}
+\label{tab:params}
+\begin{tabular}{@{}llrl@{}}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Image width  & $N_x$                 & 256   & pixels \\
+Image height & $N_y$                 & 256   & pixels \\
+Number of frames & $N$               & 16    & frames \\
+Background rate  & $\lambda_{\mathrm{bg}}$ & 100.0 & photons/pixel/frame \\
+Object signal    & $\lambda_{\mathrm{obj}}$& 20.0  & photons/frame \\
+\midrule
+True starting position & $(x_0^*,\, y_0^*)$    & $(128,\, 100)$ & pixels \\
+True velocity          & $(v_x^*,\, v_y^*)$    & $(1.5,\, {-}0.75)$ & pixels/frame \\
+\midrule
+Velocity search min    & $v_{\min}$     & $-3.0$  & pixels/frame \\
+Velocity search max    & $v_{\max}$     & $+3.0$  & pixels/frame \\
+Velocity step size     & $\Delta v$     & $0.25$  & pixels/frame \\
+\midrule
+RNG seed               & ---            & 42     & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Signal-to-Noise Analysis}
+
+The per-frame signal-to-noise ratio for a Poisson background is:
+\begin{equation}
+    \mathrm{SNR}_1
+    \;=\; \frac{\lambda_{\mathrm{obj}}}{\sqrt{\lambda_{\mathrm{bg}}}}
+    \;=\; \frac{20}{\sqrt{100}}
+    \;=\; 2.0
+\end{equation}
+
+This is well below typical single-frame detection thresholds
+($\mathrm{SNR} \geq 5$). After coherent integration across $N = 16$ frames,
+the stacked SNR becomes:
+\begin{equation}
+    \mathrm{SNR}_N
+    \;=\; \mathrm{SNR}_1 \cdot \sqrt{N}
+    \;=\; 2.0 \times \sqrt{16}
+    \;=\; 8.0
+\end{equation}
+
+\noindent which is comfortably above threshold --- but \emph{only if the
+correct trajectory is used for integration}. This is the fundamental
+premise of TBD.
+
+\subsection{Search Space Complexity}
+
+The velocity grid contains:
+\begin{equation}
+    N_v \;=\; \left\lfloor \frac{v_{\max} - v_{\min}}{\Delta v} \right\rfloor + 1
+    \;=\; \left\lfloor \frac{6.0}{0.25} \right\rfloor + 1
+    \;=\; 25
+\end{equation}
+
+\noindent velocity steps per axis, giving $N_v^2 = 625$ velocity hypotheses.
+The total number of candidate trajectories is:
+\begin{equation}
+    N_{\mathrm{traj}}
+    \;=\; N_x \cdot N_y \cdot N_v^2
+    \;=\; 256 \times 256 \times 625
+    \;=\; 40{,}960{,}000
+    \;\approx\; 41\text{M}
+\end{equation}
+
+Each trajectory evaluation requires $N = 16$ pixel lookups, yielding:
+\begin{equation}
+    N_{\mathrm{reads}}
+    \;=\; N_{\mathrm{traj}} \times N
+    \;=\; 40{,}960{,}000 \times 16
+    \;=\; 655{,}360{,}000
+    \;\approx\; 655\text{M pixel reads}
+\end{equation}
+
+% ──────────────────────────────────────────────────────────────
+\section{Algorithm Pseudocode}
+\label{sec:algorithm}
+% ──────────────────────────────────────────────────────────────
+
+\begin{algorithm}[H]
+\caption{Brute-Force Shift-and-Stack TBD}
+\label{alg:tbd}
+\begin{algorithmic}[1]
+\Require Frames $\{I_t\}_{t=0}^{N-1}$, velocity grid $\mathcal{V} = \{v_{\min}, v_{\min}+\Delta v, \ldots, v_{\max}\}$
+\Ensure Detection $(\hat{x}_0, \hat{y}_0, \hat{v}_x, \hat{v}_y)$ and test statistic $\hat{T}$
+\State $\hat{T} \gets -\infty$
+\For{$y_0 = 0$ \textbf{to} $N_y - 1$}
+    \For{$x_0 = 0$ \textbf{to} $N_x - 1$}
+        \For{$v_x \in \mathcal{V}$}
+            \For{$v_y \in \mathcal{V}$}
+                \State $T \gets 0$;\quad $\mathit{valid} \gets \textsc{True}$
+                \For{$t = 0$ \textbf{to} $N - 1$}
+                    \State $p_x \gets \mathrm{round}(x_0 + v_x \cdot t)$
+                    \State $p_y \gets \mathrm{round}(y_0 + v_y \cdot t)$
+                    \If{$p_x \notin [0, N_x)$ \textbf{or} $p_y \notin [0, N_y)$}
+                        \State $\mathit{valid} \gets \textsc{False}$;\quad \textbf{break}
+                    \EndIf
+                    \State $T \gets T + I_t[p_y,\, p_x]$
+                \EndFor
+                \If{$\mathit{valid}$ \textbf{and} $T > \hat{T}$}
+                    \State $\hat{T} \gets T$;\quad
+                           $(\hat{x}_0, \hat{y}_0, \hat{v}_x, \hat{v}_y) \gets (x_0, y_0, v_x, v_y)$
+                \EndIf
+            \EndFor
+        \EndFor
+    \EndFor
+\EndFor
+\State \Return $(\hat{x}_0, \hat{y}_0, \hat{v}_x, \hat{v}_y, \hat{T})$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{notebox}[Boundary Handling]
+If the predicted position $(p_x, p_y)$ at \emph{any} frame $t$ falls
+outside the image boundaries $[0, N_x) \times [0, N_y)$, the entire
+trajectory is marked invalid and skipped. This is physically correct:
+partial trajectories would have reduced integrated signal and should not
+compete with full-length trajectories.
+\end{notebox}
+
+% ──────────────────────────────────────────────────────────────
+\section{Binary Data Format}
+\label{sec:data_format}
+% ──────────────────────────────────────────────────────────────
+
+The Python script \texttt{tbd\_problem.py} generates two binary files.
+Your CUDA implementation must read these files.
+
+\subsection{\texttt{tbd\_frames.bin}}
+
+\begin{table}[h]
+\centering
+\caption{Frame data binary layout.}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Offset (bytes)} & \textbf{Type} & \textbf{Count} & \textbf{Description} \\
+\midrule
+0    & \texttt{int32}   & 1   & $N_x$ (image width) \\
+4    & \texttt{int32}   & 1   & $N_y$ (image height) \\
+8    & \texttt{int32}   & 1   & $N$ (number of frames) \\
+12   & \texttt{float32} & $N \times N_y \times N_x$ & Pixel data \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The pixel data is stored in \textbf{frame-major, row-major} order:
+\begin{equation}
+    \texttt{offset}(t, r, c) \;=\; 12 + 4 \times \bigl(t \cdot N_y \cdot N_x + r \cdot N_x + c\bigr) \;\text{bytes}
+\end{equation}
+
+\subsection{\texttt{tbd\_params.bin}}
+
+\begin{table}[h]
+\centering
+\caption{Parameter binary layout.}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Offset (bytes)} & \textbf{Type} & \textbf{Count} & \textbf{Description} \\
+\midrule
+0  & \texttt{float32} & 1 & $v_{\min}$ \\
+4  & \texttt{float32} & 1 & $v_{\max}$ \\
+8  & \texttt{float32} & 1 & $\Delta v$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ──────────────────────────────────────────────────────────────
+\section{Your Task}
+\label{sec:task}
+% ──────────────────────────────────────────────────────────────
+
+\subsection{Deliverables}
+
+Implement a \textbf{CUDA/C++ program} that:
+\begin{enumerate}[leftmargin=2em]
+    \item Reads \texttt{tbd\_frames.bin} and \texttt{tbd\_params.bin}
+    \item Performs the brute-force shift-and-stack search
+          (Eq.~\ref{eq:test_stat}) entirely on the GPU
+    \item Reports the detected trajectory
+          $(\hat{x}_0, \hat{y}_0, \hat{v}_x, \hat{v}_y)$ and test
+          statistic $\hat{T}$
+    \item Reports wall-clock kernel execution time using CUDA events
+    \item Compiles with \texttt{nvcc} (any SM architecture $\geq 7.0$)
+\end{enumerate}
+
+\subsection{Setup Instructions}
+
+\begin{enumerate}[leftmargin=2em]
+    \item Generate the test data:
+\begin{lstlisting}[style=pythonstyle, numbers=none, xleftmargin=1em, framexleftmargin=0em]
+python3 tbd_problem.py
+\end{lstlisting}
+    \item Verify that \texttt{tbd\_frames.bin}, \texttt{tbd\_params.bin},
+          and \texttt{tbd\_reference.txt} are created.
+    \item Implement your solution and compile:
+\begin{lstlisting}[style=cudastyle, numbers=none, xleftmargin=1em, framexleftmargin=0em]
+nvcc -O3 -arch=sm_86 -o tbd_solution your_solution.cu
+./tbd_solution tbd_frames.bin tbd_params.bin
+\end{lstlisting}
+    \item Your output must match \texttt{tbd\_reference.txt}.
+\end{enumerate}
+
+\subsection{Reference Answer}
+
+\begin{table}[h]
+\centering
+\caption{Expected detection result.}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Quantity} & \textbf{Value} \\
+\midrule
+$\hat{x}_0$    & 128 \\
+$\hat{y}_0$    & 100 \\
+$\hat{v}_x$    & 1.50 pixels/frame \\
+$\hat{v}_y$    & $-$0.75 pixels/frame \\
+$\hat{T}$      & 1881.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ──────────────────────────────────────────────────────────────
+\section{GPU Parallelization Considerations}
+\label{sec:gpu}
+% ──────────────────────────────────────────────────────────────
+
+This section describes the key considerations for an efficient CUDA
+implementation. Candidates are expected to address \emph{at least} items
+\ref{item:thread_map}--\ref{item:reduction}; items
+\ref{item:shared}--\ref{item:advanced} are differentiators for strong
+candidates.
+
+\subsection{Thread-to-Work Mapping}
+\label{item:thread_map}
+
+The search has a natural 4D structure: $(x_0, y_0, v_x, v_y)$. A common
+and effective strategy is to assign one GPU thread per starting pixel
+$(x_0, y_0)$, with each thread looping over all velocity hypotheses.
+This gives $256 \times 256 = 65{,}536$ threads --- sufficient for good
+occupancy on modern GPUs.
+
+\begin{notebox}[Thread Block Configuration]
+A $16 \times 16$ thread block (256 threads) is a natural choice matching
+the 2D spatial structure. With $16 \times 16$ blocks in the grid, this
+maps directly to the $256 \times 256$ pixel space.
+\end{notebox}
+
+\subsection{Memory Hierarchy}
+\label{item:memory}
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Constant memory} (\texttt{\_\_constant\_\_}): Ideal for
+    the velocity grid. All threads read the \emph{same} velocity values
+    simultaneously (broadcast pattern), making constant memory's single-broadcast
+    cache architecture a perfect fit. The velocity grid ($25 \times 4$
+    bytes $= 100$ bytes) fits trivially in the 64\,KB constant memory limit.
+
+    \item \textbf{Read-only / texture cache} (\texttt{\_\_ldg()}): Frame
+    data is read-only and accessed with spatial locality (neighboring threads
+    read nearby pixels). Using \texttt{\_\_ldg()} intrinsics routes reads
+    through the read-only data cache, which is optimized for this pattern.
+
+    \item \textbf{Registers}: The running sum $T$, validity flag, and
+    best-so-far tracking variables should reside in registers. With $N_v^2 = 625$
+    iterations per thread, register pressure is low.
+\end{itemize}
+
+\subsection{Global Memory Access Patterns}
+
+For adjacent threads (neighboring $x_0$ values), the predicted pixel positions
+at frame $t$ are:
+\begin{equation}
+    p_x^{(i)} = \mathrm{round}(x_0^{(i)} + v_x \cdot t)
+\end{equation}
+
+Since $x_0$ values differ by 1 pixel, the read addresses differ by 1 float
+--- this is \textbf{coalesced} for small velocities and nearly coalesced for
+larger ones, which is favorable for global memory throughput.
+
+\subsection{Reduction}
+\label{item:reduction}
+
+After the search kernel, each pixel has a local best statistic. A parallel
+reduction is needed to find the global maximum across all $256 \times 256$
+pixels. This can be implemented as:
+\begin{enumerate}[leftmargin=2em]
+    \item A shared-memory tree reduction within each thread block
+    \item A final reduction over block-level results (on host or with a
+    second kernel)
+\end{enumerate}
+
+\subsection{Shared Memory Tiling (Advanced)}
+\label{item:shared}
+
+For each velocity hypothesis and frame $t$, threads in a block access a
+\emph{shifted} tile of the frame. One could preload the relevant tile
+(plus halo) into shared memory before the inner loop. However, given that
+the \texttt{\_\_ldg()} cache already handles this pattern well and the frame
+data (4\,MB) fits comfortably in L2 cache on modern GPUs, the benefit
+may be marginal. A candidate who \emph{analyzes} this tradeoff
+(with or without implementing it) demonstrates strong understanding.
+
+\subsection{Further Optimizations (Advanced)}
+\label{item:advanced}
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Early termination}: Skip velocity hypotheses where the
+    first few frames already guarantee the trajectory exits the image.
+
+    \item \textbf{Velocity-parallel decomposition}: Instead of one thread
+    per pixel looping over velocities, launch threads over
+    $(x_0, y_0, v_x)$ and loop over $v_y$ (or vice versa), increasing
+    parallelism at the cost of a more complex reduction.
+
+    \item \textbf{Half-precision accumulation}: Use \texttt{\_\_half2}
+    arithmetic for frame reads, accumulating in FP32. This doubles memory
+    bandwidth utilization on architectures supporting native FP16.
+
+    \item \textbf{Warp-level primitives}: Use \texttt{\_\_shfl\_down\_sync()}
+    for the first stages of reduction, avoiding shared memory bank conflicts.
+
+    \item \textbf{Streams and overlap}: Overlap data transfer with
+    computation using CUDA streams (less relevant here since the data is
+    small, but shows awareness of the technique).
+\end{itemize}
+
+% ──────────────────────────────────────────────────────────────
+\section{Performance Targets}
+\label{sec:performance}
+% ──────────────────────────────────────────────────────────────
+
+\begin{table}[h]
+\centering
+\caption{Performance reference points.}
+\label{tab:perf}
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+\textbf{Implementation} & \textbf{Est.\ Time} & \textbf{Speedup} & \textbf{Notes} \\
+\midrule
+Python (pure loops)      & $\sim$3 hours     & $1\times$        & Algorithm~\ref{alg:tbd} verbatim \\
+NumPy (vectorized)       & $\sim$3 seconds   & $\sim$3600$\times$  & Vectorize over $(x_0, y_0)$ \\
+CUDA (basic)             & $<$ 100 ms        & $>$100{,}000$\times$ & Correct thread mapping \\
+CUDA (optimized)         & $<$ 20 ms         & $>$500{,}000$\times$ & Memory hierarchy tuned \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{warnbox}[Correctness First]
+An implementation that produces the correct detection in 200\,ms is
+\textbf{far more valuable} than one that runs in 5\,ms but gives the wrong
+answer. Verify correctness against \texttt{tbd\_reference.txt} before
+optimizing.
+\end{warnbox}
+
+% ──────────────────────────────────────────────────────────────
+\section{Evaluation Rubric}
+\label{sec:rubric}
+% ──────────────────────────────────────────────────────────────
+
+\begin{table}[h]
+\centering
+\caption{Scoring rubric (100 points total).}
+\label{tab:rubric}
+\begin{tabular}{@{}p{4.5cm}cp{7.5cm}@{}}
+\toprule
+\textbf{Category} & \textbf{Points} & \textbf{Criteria} \\
+\midrule
+Correctness &
+30 &
+Detected trajectory matches reference. Proper boundary handling.
+No race conditions or undefined behavior. \\
+\addlinespace
+Performance &
+25 &
+Kernel time under 100\,ms (baseline pass). Bonus for sub-20\,ms.
+Proper use of CUDA events for timing. \\
+\addlinespace
+Parallelization Strategy &
+20 &
+Sensible thread-to-work mapping with good occupancy. Block size
+justified. Scalability to larger problems. \\
+\addlinespace
+Memory Optimization &
+15 &
+Use of constant memory for velocity grid. Awareness of coalescing.
+Use of \texttt{\_\_ldg()} or texture cache. \\
+\addlinespace
+Code Quality &
+10 &
+Error handling (\texttt{cudaGetLastError}). Readable code structure.
+Clean build with no warnings. Comments on design choices. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ──────────────────────────────────────────────────────────────
+\section{Context: Why This Matters}
+\label{sec:context}
+% ──────────────────────────────────────────────────────────────
+
+This interview problem is a simplified version of the real computational
+challenge at Zetascope. In the operational system:
+
+\begin{itemize}[leftmargin=2em]
+    \item Images are $4096 \times 4096$ (or larger) from qCMOS sensors
+    \item Velocity grids may contain $\sim$10{,}000+ hypotheses
+    \item Processing must happen in \emph{real-time} within the sensor's
+          integration window
+    \item The system runs on space-qualified embedded GPUs
+          (NVIDIA Jetson AGX Orin class) with strict power and thermal budgets
+    \item Objects of interest may contribute fewer than \textbf{one photon
+          per frame} on average, requiring integration across hundreds of frames
+\end{itemize}
+
+\noindent Efficiently mapping brute-force TBD to GPU hardware is the
+foundation upon which all of our more advanced algorithmic accelerations
+(temporal-velocity pyramids, multi-resolution search, sensor-algorithm
+co-optimization) are built. The skills tested here --- thread mapping,
+memory hierarchy exploitation, parallel reduction, and performance
+measurement --- are directly applicable to the production system.
+
+\vfill
+\begin{center}
+\rule{0.5\textwidth}{0.4pt}\\[0.5em]
+{\small\textcolor{gray}{%
+    Zetascope, Inc.\ --- Confidential Interview Material\\
+    Do not distribute.
+}}
+\end{center}
+
+\end{document}
