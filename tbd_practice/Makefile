@@ -3,7 +3,7 @@
 #   sm_70 = V100, sm_75 = T4, sm_80 = A100, sm_86 = RTX 3090, sm_89 = RTX 4090, sm_87 = Jetson Orin
 
 NVCC      = nvcc
-NVCCFLAGS = -O3 -arch=sm_87 --use_fast_math -lineinfo --allow-unsupported-compiler
+NVCCFLAGS = -O3 -arch=sm_86 --use_fast_math -lineinfo --allow-unsupported-compiler
 TARGET    = tbd_solution
 
 .PHONY: all clean data run
