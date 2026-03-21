@@ -1,2 +1,5 @@
 # Claude Code memory files
 .claude/
+
+# Binary files
+*.bin
