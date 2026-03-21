@@ -65,22 +65,77 @@ import sys
 # ============================================================
 # PROBLEM PARAMETERS (DO NOT MODIFY)
 # ============================================================
-NX, NY = 256, 256           # Image dimensions (pixels)
-N_FRAMES = 16               # Number of temporal frames
+NX, NY = 512, 512           # Image dimensions (pixels)
+N_FRAMES = 300               # Number of temporal frames
 BG_MEAN = 100.0             # Background Poisson rate (photons/pixel/frame)
-OBJ_SIGNAL = 20.0           # Object signal added per frame (photons)
-                             # Per-frame SNR ~ 20/sqrt(100) = 2.0  (invisible by eye)
-                             # Stacked SNR  ~ 2.0*sqrt(16)  = 8.0  (clearly detectable)
+OBJ_SIGNAL = 15.0           # Object signal added per frame (photons)
+                             # Per-frame SNR ~ OBJ_SIGNAL / sqrt(BG_MEAN)
+                             # Stacked SNR  ~ per_frame_SNR * sqrt(N_FRAMES)
 
-# Ground truth trajectory (for validation only — your code should FIND this)
-TRUE_X0, TRUE_Y0 = 128.0, 100.0
-TRUE_VX, TRUE_VY = 1.5, -0.75
+# Ground truth trajectory — auto-computed from current parameters (see below)
 
 # Velocity search grid
+V_HYP = 100
 V_MIN  = -3.0               # Min velocity (pixels/frame)
 V_MAX  =  3.0               # Max velocity (pixels/frame)
-V_STEP =  0.25              # Velocity step size
+V_STEP = (V_MAX - V_MIN) / (V_HYP - 1)  # Velocity step size
 SEED   = 42                 # RNG seed for reproducibility
+NUMPY_COMPUTE = False        # Run NumPy vectorized reference search (set False to skip)
+VX_VY_RATIO   = 2.0         # Desired ratio of vx / |vy| for the ground truth trajectory
+
+
+# ============================================================
+# GROUND TRUTH (auto-computed to be valid for current params)
+# ============================================================
+def compute_ground_truth():
+    """
+    Pick a ground truth trajectory that:
+      - keeps the object inside [0, NX-1] x [0, NY-1] for all N_FRAMES
+      - uses a fixed 0.25 px/frame grid so values are always clean round numbers,
+        independent of V_HYP
+    Starting position is centered in the valid range.
+    """
+    GT_STEP = V_STEP
+    velocities = np.arange(V_MIN, V_MAX + GT_STEP / 2, GT_STEP)
+
+    def valid_start_range(v, n_frames, n_pixels):
+        """Return (lo, hi) of valid starting indices for velocity v."""
+        end_disp = int(round(v * (n_frames - 1)))
+        return (0, n_pixels - 1 - end_disp) if v >= 0 else (-end_disp, n_pixels - 1)
+
+    valid_vx = [v for v in velocities
+                if valid_start_range(v, N_FRAMES, NX)[0] <= valid_start_range(v, N_FRAMES, NX)[1]]
+    valid_vy = [v for v in velocities
+                if valid_start_range(v, N_FRAMES, NY)[0] <= valid_start_range(v, N_FRAMES, NY)[1]]
+
+    def pick_v(candidates, positive, target_mag):
+        """Pick the valid non-zero velocity whose magnitude is closest to target_mag."""
+        nonzero = [v for v in candidates if (v > 0 if positive else v < 0)]
+        if not nonzero:
+            return 0.0
+        return float(min(nonzero, key=lambda v: abs(abs(v) - target_mag)))
+
+    # Choose base magnitude so the trajectory uses ~1/3 of the image in each axis,
+    # then scale vx and vy according to VX_VY_RATIO so they are never equal.
+    max_vx_mag = max((abs(v) for v in valid_vx if v != 0), default=0.0)
+    max_vy_mag = max((abs(v) for v in valid_vy if v != 0), default=0.0)
+    base_mag = min(max_vx_mag, max_vy_mag) / 3
+    # vx_target / vy_target = VX_VY_RATIO  →  vx_target = ratio * vy_target
+    # keep geometric mean equal to base_mag: sqrt(vx_target * vy_target) = base_mag
+    vy_target = base_mag / (VX_VY_RATIO ** 0.5)
+    vx_target = VX_VY_RATIO * vy_target
+
+    vx = pick_v(valid_vx, positive=True,  target_mag=vx_target)
+    vy = pick_v(valid_vy, positive=False, target_mag=vy_target)
+
+    lox, hix = valid_start_range(vx, N_FRAMES, NX)
+    loy, hiy = valid_start_range(vy, N_FRAMES, NY)
+    x0 = float((lox + hix) // 2)
+    y0 = float((loy + hiy) // 2)
+    return x0, y0, vx, vy
+
+
+TRUE_X0, TRUE_Y0, TRUE_VX, TRUE_VY = compute_ground_truth()
 
 
 # ============================================================
@@ -287,37 +342,50 @@ def main():
     print("=" * 64)
     print()
 
+    # --- Print ground truth before any computation ---
+    per_snr   = OBJ_SIGNAL / np.sqrt(BG_MEAN)
+    stack_snr = per_snr * np.sqrt(N_FRAMES)
+    print("[0] Ground truth trajectory (auto-computed):")
+    print(f"    x0={TRUE_X0}, y0={TRUE_Y0}, vx={TRUE_VX}, vy={TRUE_VY}")
+    print(f"    Image       : {NX} x {NY},  frames: {N_FRAMES}")
+    print(f"    Per-frame SNR : {per_snr:.2f}  (invisible by eye)")
+    print(f"    Stacked SNR   : {stack_snr:.2f}  (over {N_FRAMES} frames)")
+    print()
+
     # --- Generate data ---
     print("[1] Generating synthetic data...")
     frames = generate_data()
     save_binary(frames)
     save_params()
-    print(f"  Ground truth: x0={TRUE_X0}, y0={TRUE_Y0}, "
-          f"vx={TRUE_VX}, vy={TRUE_VY}")
-    print(f"  Per-frame SNR: {OBJ_SIGNAL / np.sqrt(BG_MEAN):.2f}")
-    print(f"  Stacked  SNR : {OBJ_SIGNAL * np.sqrt(N_FRAMES) / np.sqrt(BG_MEAN):.2f}")
+    print()
+
+    # --- Always write ground truth to reference file ---
+    with open("tbd_reference.txt", "w") as f:
+        f.write(f"x0={TRUE_X0:.2f}\n")
+        f.write(f"y0={TRUE_Y0:.2f}\n")
+        f.write(f"vx={TRUE_VX:.2f}\n")
+        f.write(f"vy={TRUE_VY:.2f}\n")
+    print(f"  Saved tbd_reference.txt (ground truth)")
     print()
 
     # --- Compute reference answer (vectorized, fast) ---
-    print("[2] Computing reference answer (NumPy vectorized)...")
-    x0, y0, vx, vy, stat, elapsed = vectorized_tbd(frames)
-    print()
-    print(f"  REFERENCE RESULT:")
-    print(f"    Detected : x0={x0}, y0={y0}, vx={vx:.2f}, vy={vy:.2f}")
-    print(f"    Statistic: {stat:.1f}")
-    print(f"    Time     : {elapsed:.2f} s")
-    print(f"    Pos error: dx={x0 - TRUE_X0:.1f}, dy={y0 - TRUE_Y0:.1f}")
-    print(f"    Vel error: dvx={vx - TRUE_VX:.2f}, dvy={vy - TRUE_VY:.2f}")
+    if NUMPY_COMPUTE:
+        print("[2] Computing reference answer (NumPy vectorized)...")
+        x0, y0, vx, vy, stat, elapsed = vectorized_tbd(frames)
+        print()
+        print(f"  REFERENCE RESULT:")
+        print(f"    Detected : x0={x0}, y0={y0}, vx={vx:.2f}, vy={vy:.2f}")
+        print(f"    Statistic: {stat:.1f}")
+        print(f"    Time     : {elapsed:.2f} s")
+        print(f"    Pos error: dx={x0 - TRUE_X0:.1f}, dy={y0 - TRUE_Y0:.1f}")
+        print(f"    Vel error: dvx={vx - TRUE_VX:.2f}, dvy={vy - TRUE_VY:.2f}")
 
-    # Save reference result
-    with open("tbd_reference.txt", "w") as f:
-        f.write(f"x0={x0}\n")
-        f.write(f"y0={y0}\n")
-        f.write(f"vx={vx:.4f}\n")
-        f.write(f"vy={vy:.4f}\n")
-        f.write(f"statistic={stat:.6f}\n")
-    print(f"  Saved tbd_reference.txt")
-    print()
+        with open("tbd_reference.txt", "a") as f:
+            f.write(f"statistic={stat:.6f}\n")
+        print(f"  Updated tbd_reference.txt (added statistic)")
+        print()
+    else:
+        print("[2] Skipping NumPy vectorized search (NUMPY_COMPUTE = False)")
 
     # --- Optional: run the pure-Python brute-force on a small patch ---
     run_bruteforce = "--bruteforce" in sys.argv

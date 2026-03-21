@@ -26,6 +26,7 @@
 #include <cstring>
 #include <cmath>
 #include <cfloat>
+#include <chrono>
 #include <cuda_runtime.h>
 
 // ============================================================
@@ -44,12 +45,11 @@
 // ============================================================
 // Constants
 // ============================================================
-#define MAX_VEL     64      // Max entries in velocity grid per axis
-#define MAX_FRAMES  64      // Max number of temporal frames
 
-// Velocity grids in constant memory (small, broadcast access pattern)
-__constant__ float d_vel[MAX_VEL];      // Shared velocity axis values
-__constant__ int   d_n_vel;             // Number of velocity grid points
+// Velocity grid described by range + count (linspace); supports arbitrary N_VEL
+__constant__ float d_v_min;             // Min velocity (pixels/frame)
+__constant__ float d_v_max;             // Max velocity (pixels/frame)
+__constant__ int   d_n_vel;             // Number of velocity hypotheses per axis
 __constant__ int   d_n_frames;          // Number of frames
 
 // Frame dimensions in constant memory
@@ -89,12 +89,15 @@ __global__ void tbd_search_kernel(
     int   local_vxi  = 0;
     int   local_vyi  = 0;
 
+    // Linspace step: v_min + i * (v_max - v_min) / (n_vel - 1)
+    const float v_step = (nv > 1) ? (d_v_max - d_v_min) / (float)(nv - 1) : 0.0f;
+
     // Loop over all velocity hypotheses
     for (int vi = 0; vi < nv; vi++) {
-        const float vx = d_vel[vi];
+        const float vx = d_v_min + vi * v_step;
 
         for (int vj = 0; vj < nv; vj++) {
-            const float vy = d_vel[vj];
+            const float vy = d_v_min + vj * v_step;
 
             // Shift-and-stack along this trajectory
             float stat = 0.0f;
@@ -221,7 +224,7 @@ float* load_frames(const char* filename, int* nx, int* ny, int* nf) {
     return data;
 }
 
-void load_params(const char* filename, float* v_min, float* v_max, float* v_step) {
+void load_params(const char* filename, float* v_min, float* v_max, int* n_vel) {
     FILE* f = fopen(filename, "rb");
     if (!f) { fprintf(stderr, "Cannot open %s\n", filename); exit(1); }
 
@@ -229,9 +232,11 @@ void load_params(const char* filename, float* v_min, float* v_max, float* v_step
     if (fread(params, sizeof(float), 3, f) != 3) {
         fprintf(stderr, "Failed to read params\n"); exit(1);
     }
-    *v_min  = params[0];
-    *v_max  = params[1];
-    *v_step = params[2];
+    *v_min = params[0];
+    *v_max = params[1];
+    float v_step = params[2];
+    // Derive n_vel from the step: same formula as np.arange in Python
+    *n_vel = (int)roundf((*v_max - *v_min) / v_step) + 1;
     fclose(f);
 }
 
@@ -255,37 +260,31 @@ int main(int argc, char** argv) {
            prop.multiProcessorCount,
            prop.totalGlobalMem / 1e9);
 
+    // --- Start total wall-clock timer ---
+    auto total_start = std::chrono::steady_clock::now();
+
     // --- Load data ---
     int nx, ny, nf;
     float* h_frames = load_frames(frame_file, &nx, &ny, &nf);
     printf("Loaded frames: %d x %d x %d frames\n", nx, ny, nf);
 
-    float v_min, v_max, v_step;
-    load_params(param_file, &v_min, &v_max, &v_step);
-
-    // Build velocity grid
-    int n_vel = 0;
-    float h_vel[MAX_VEL];
-    for (float v = v_min; v <= v_max + v_step * 0.5f; v += v_step) {
-        if (n_vel >= MAX_VEL) {
-            fprintf(stderr, "Too many velocity steps (max %d)\n", MAX_VEL);
-            exit(1);
-        }
-        h_vel[n_vel++] = v;
-    }
+    float v_min, v_max;
+    int n_vel;
+    load_params(param_file, &v_min, &v_max, &n_vel);
 
     int n_pixels = nx * ny;
     long long total_traj = (long long)n_pixels * n_vel * n_vel;
     long long total_reads = total_traj * nf;
 
-    printf("Velocity grid : %d x %d = %d hypotheses  (%.2f to %.2f, step %.2f)\n",
-           n_vel, n_vel, n_vel * n_vel, v_min, v_max, v_step);
+    printf("Velocity grid : %d x %d = %d hypotheses  (%.2f to %.2f)\n",
+           n_vel, n_vel, n_vel * n_vel, v_min, v_max);
     printf("Total trajectories : %lld\n", total_traj);
     printf("Total pixel reads  : %lld\n", total_reads);
     printf("\n");
 
     // --- Copy constants to device ---
-    CUDA_CHECK(cudaMemcpyToSymbol(d_vel,      h_vel, n_vel * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_v_min,    &v_min, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_v_max,    &v_max, sizeof(float)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_n_vel,    &n_vel, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_n_frames, &nf,    sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_nx,       &nx,    sizeof(int)));
@@ -381,8 +380,9 @@ int main(int argc, char** argv) {
     // --- Decode result ---
     int det_x0 = best.pixel_idx % nx;
     int det_y0 = best.pixel_idx / nx;
-    float det_vx = h_vel[best.vxi];
-    float det_vy = h_vel[best.vyi];
+    float v_step_out = (n_vel > 1) ? (v_max - v_min) / (float)(n_vel - 1) : 0.0f;
+    float det_vx = v_min + best.vxi * v_step_out;
+    float det_vy = v_min + best.vyi * v_step_out;
 
     printf("================================================================\n");
     printf("  RESULT\n");
@@ -394,6 +394,11 @@ int main(int argc, char** argv) {
            total_traj / (kernel_ms * 1e6));
     printf("  Effective bandwidth: %.2f GB/s (pixel reads)\n",
            total_reads * sizeof(float) / (kernel_ms * 1e6));
+
+    auto total_stop = std::chrono::steady_clock::now();
+    double total_ms = std::chrono::duration<double, std::milli>(total_stop - total_start).count();
+    printf("  Total GPU time    : %.3f ms\n", kernel_ms + reduce_ms);
+    printf("  Total wall time   : %.3f ms\n", total_ms);
     printf("================================================================\n");
 
     // --- Cleanup ---

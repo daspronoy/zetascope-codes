@@ -4,13 +4,14 @@
 
 NVCC      = nvcc
 NVCCFLAGS = -O3 -arch=sm_87 --use_fast_math -lineinfo --allow-unsupported-compiler
-TARGET    = tbd_solution
+TARGET    = tbd_orin
+# TARGET    = tbd_solution
 
 .PHONY: all clean data run
 
 all: $(TARGET)
 
-$(TARGET): tbd_solution.cu
+$(TARGET): tbd_orin.cu
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 # Generate test data using Python
