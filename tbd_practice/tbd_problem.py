@@ -78,7 +78,7 @@ import sys
 NX, NY = 1024, 1024           # Image dimensions (pixels)
 N_FRAMES = 300               # Number of temporal frames
 BG_MEAN = 100.0             # Background Poisson rate (photons/pixel/frame)
-OBJ_SIGNAL = 25.0           # Object signal added per frame (photons)
+OBJ_SIGNAL = 35.0           # Object signal added per frame (photons)
                              # Per-frame SNR ~ OBJ_SIGNAL / sqrt(BG_MEAN)
                              # Stacked SNR  ~ per_frame_SNR * sqrt(N_FRAMES)
 

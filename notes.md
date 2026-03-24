@@ -434,10 +434,141 @@ nvcc -O3 -arch=sm_86 -o tbd_solution tbd_solution.cu
 
 ---
 
-If you'd like, I can now:
-- run a quick read to confirm this file was written correctly, and
-- optionally update `tbd_solution.cu` or create a small test harness to
-	automatically compare the CUDA output to `tbd_reference.txt`.
+===================================================================================
+## Optimization Notes: Register Pressure & 12x Speedup
 
-End of notes.
+### Problem
+
+The fused `tbd_pyramid_search` kernel is register-hungry. The two `Candidate topk[TOP_K]` arrays (TOP_K=10, 3 floats each) alone consume ~60 registers, on top of ~15 scalar locals. On sm_87 (Orin), this limits occupancy to ~1–2 blocks/SM when you need 8+ for full utilization, severely throttling effective memory bandwidth.
+
+### Root Causes
+
+1. **`topk_L0[10]` + `topk_L1[10]`** in registers simultaneously — 60 registers minimum
+2. **All 3 pyramid levels fused into one thread** — all intermediate state lives in registers at once
+3. **Scalar locals**: `nx, ny, nf, nv0-2, vx/vy_lo/hi, inv_T, cvx, cvy, stat, global_best_*` — ~15 more
+
+---
+
+### Strategy 1: Shift-and-Stack (Velocity-Outer Loop)
+
+The most fundamental restructuring. Instead of *pixel-outer, velocity-inner*, flip to *velocity-outer, pixel-inner*.
+
+**Key insight**: For a fixed `(vx, vy)`, every pixel's score is:
+```
+S(x0, y0) = Σ_t  frame[t][y0 + vy*t][x0 + vx*t]
+```
+This is a sum of shifted frames — a "shift image". Compute it once for all pixels simultaneously.
+
+```
+For each velocity pair (vx, vy):
+    GPU kernel: H[y,x] = Σ_t frame[t][y+vy*t][x+vx*t]   // ~5 registers/thread
+    GPU kernel: per-pixel topk update → d_topk_L0[pixel][10]  // lives in global mem
+```
+
+**Why this hits 12x:**
+- Each shift kernel needs ~5 registers → occupancy goes from ~12% to 75%+, ~6x alone
+- Coalesced reads: all threads in a warp read the same frame `t` at consecutive `x` → perfect L2 reuse
+- `topk_L0` lives in global memory between launches (10M × 10 × 12 bytes = 1.2 GB), not registers
+
+Example shift kernel:
+
+```cuda
+__global__ void shift_and_accumulate(
+    const __half* __restrict__ frames,
+    float* __restrict__ H,   // [ny × nx] output
+    float vx, float vy,
+    int nx, int ny, int nf)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= nx || y >= ny) return;
+
+    float acc = 0.f;
+    const int frame_stride = ny * nx;
+    for (int t = 0; t < nf; t++) {
+        int px = __float2int_rn(x + vx * t);
+        int py = __float2int_rn(y + vy * t);
+        if (px < 0 || px >= nx || py < 0 || py >= ny) { acc = -FLT_MAX; break; }
+        acc += __half2float(frames[(size_t)t * frame_stride + py * nx + px]);
+    }
+    H[y * nx + x] = acc;
+}
+```
+
+This kernel uses ~6 registers vs ~100+ in the fused kernel.
+
+---
+
+### Strategy 2: Spatial Downselection (CPU+GPU Hybrid)
+
+After L0, you do **not** need to run L1+L2 on all 10M pixels. Since only the globally best trajectory matters, only refine pixels with high L0 scores.
+
+```
+GPU:  L0 search on all 10M pixels → d_best_stats[10M], d_topk_L0[10M×10]
+
+D2H:  download d_best_stats[10M] → 40 MB at 200 GB/s ≈ 0.2 ms
+
+CPU:  std::nth_element → find top-50K pixel indices (~5–20 ms, overlapped)
+      → upload compact index list
+
+GPU:  L1 kernel on 50K pixels only (reads their topk_L0 from global)
+GPU:  L2 kernel on 50K pixels only
+```
+
+**Work reduction for L1+L2:**
+
+| | Evals |
+|---|---|
+| L1+L2 on all 10M pixels | ~14.6B |
+| L1+L2 on top-50K pixels | ~73M |
+| Reduction | **~200x** |
+
+L1+L2 accounts for ~87% of total work, so this gives ~**7–8x** speedup on its own. Correctness assumption: the true best pixel will rank in the top-50K by L0 score, which holds at any reasonable SNR (L0 and L2 are the same metric at different velocity resolutions). The threshold can be tuned conservatively at no significant cost.
+
+---
+
+### Strategy 3: Multi-Pass Kernel Split
+
+Without restructuring the algorithm, split the single fused kernel into 3 kernels with intermediate global memory:
+
+- **L0 kernel**: only `topk_L0[10]` in registers → writes `d_topk_L0[10M×10]`
+- **L1 kernel**: reads `d_topk_L0`, only `topk_L1[10]` in registers → writes `d_topk_L1[10M×10]`
+- **L2 kernel**: reads `d_topk_L1`, only 3 scalars in registers → writes best result
+
+Register savings per kernel: ~30–40 freed (removing the other level's topk). Intermediate buffers cost 2 × 1.2 GB = 2.4 GB, fits on 32–64 GB Orin. Expected gain: ~1.5–2x occupancy improvement per kernel — not sufficient alone for 12x, but a useful complement.
+
+---
+
+### Strategy 4: Warp-Per-Pixel
+
+Assign 1 warp (32 threads) to each pixel. Partition the velocity search space across the warp:
+
+- Thread `i` handles velocity indices `i, i+32, i+64, ...` → each thread tracks **1 local best**
+- After inner loops, use `__shfl_sync` warp reduce to merge into warp-wide top-10
+- `topk_L0[10]` becomes distributed: each thread holds ~1 entry, not all 10
+- Register usage for topk drops from 30 → ~3 per thread
+- Expected occupancy improvement: 2–4x
+
+---
+
+### Recommended Path to 12x
+
+Combine **Strategy 1** (shift-and-stack) + **Strategy 2** (spatial downselection):
+
+| Phase | Where | Est. fraction of original time |
+|-------|--------|-------------------------------|
+| L0 shift-and-stack (225 velocity kernels) | GPU | ~13% |
+| Spatial filter (nth_element on 10M floats) | CPU (async) | ~5 ms, overlapped |
+| L1+L2 on top-50K pixels | GPU | ~0.4% |
+
+**Total: ~13.4% of original runtime → ~7.5x from spatial filtering × ~1.5–2x from occupancy = 11–15x**, squarely hitting the 12x target.
+
+---
+
+### Compile flags to diagnose register usage
+
+```bash
+nvcc -O3 -arch=sm_87 --use_fast_math --ptxas-options=-v -o tbd_orin tbd_orin_optimized_v2.cu 2>&1 | grep "registers"
+```
+
 
