@@ -79,7 +79,7 @@
 #define L2_RADIUS   0.10f
 
 // How many top candidates to refine at each level
-#define TOP_K       10
+#define TOP_K       5
 
 // Row chunking for kernel launches (avoids watchdog timeout)
 #define CHUNK_ROWS  128   // Larger chunks OK since pyramid is fast
@@ -162,7 +162,7 @@ __device__ __forceinline__ void topk_insert(
 // levels internally. This avoids storing intermediate results
 // for 10M pixels and keeps everything in registers.
 // ============================================================
-__global__ void tbd_pyramid_search(
+__global__ void __launch_bounds__(128, 4) tbd_pyramid_search(
     const __half* __restrict__ frames,
     float*  best_stats,    // [N_PIXELS] output: best statistic
     float*  best_vx_out,   // [N_PIXELS] output: best vx
