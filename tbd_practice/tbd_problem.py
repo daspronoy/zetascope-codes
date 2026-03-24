@@ -63,9 +63,19 @@ import os
 import sys
 
 # ============================================================
-# PROBLEM PARAMETERS (DO NOT MODIFY)
+# PROBLEM PARAMETERS (Target)
 # ============================================================
-NX, NY = 3072, 3072           # Image dimensions (pixels)
+# NX, NY = 3072, 3072           # Image dimensions (pixels)
+# N_FRAMES = 300               # Number of temporal frames
+# BG_MEAN = 100.0             # Background Poisson rate (photons/pixel/frame)
+# OBJ_SIGNAL = 25.0           # Object signal added per frame (photons)
+#                              # Per-frame SNR ~ OBJ_SIGNAL / sqrt(BG_MEAN)
+#                              # Stacked SNR  ~ per_frame_SNR * sqrt(N_FRAMES)
+
+# ============================================================
+# PROBLEM PARAMETERS (Benchmarking)
+# ============================================================
+NX, NY = 1024, 1024           # Image dimensions (pixels)
 N_FRAMES = 300               # Number of temporal frames
 BG_MEAN = 100.0             # Background Poisson rate (photons/pixel/frame)
 OBJ_SIGNAL = 25.0           # Object signal added per frame (photons)
@@ -75,7 +85,8 @@ OBJ_SIGNAL = 25.0           # Object signal added per frame (photons)
 # Ground truth trajectory — auto-computed from current parameters (see below)
 
 # Velocity search grid
-V_HYP = 155
+# V_HYP = 155               # Corresponds to 24025 velocity hypothesis
+V_HYP = 50
 V_MIN  = -3.0               # Min velocity (pixels/frame)
 V_MAX  =  3.0               # Max velocity (pixels/frame)
 V_STEP = (V_MAX - V_MIN) / (V_HYP - 1)  # Velocity step size

@@ -1,6 +1,6 @@
 # Makefile for TBD Interview Problem
 # Adjust SM architecture to match your GPU:
-#   sm_70 = V100, sm_75 = T4, sm_80 = A100, sm_86 = RTX 3090, sm_89 = RTX 4090, sm_87 = Jetson Orin
+#   sm_70 = V100 (Volta), sm_75 = T4 (Turing), sm_80 = A100 (Ampere), sm_86 = RTX 3090 (Ampere), sm_89 = RTX 4090 (Ada Lovelace), sm_87 = Jetson Orin (Ampere), sm_120 = 5070Ti (Blackwell)
 
 NVCC      = nvcc
 NVCCFLAGS = -O3 -arch=sm_87 --use_fast_math -lineinfo --allow-unsupported-compiler
