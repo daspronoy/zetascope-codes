@@ -1,6 +1,6 @@
 Changelogs:
 
-v2: Multipass kernel split + warp-per-pixel
+v2: Multipass kernel split + warp-per-pixel (tbd_v2.cu)
     - Runtimes: kernel time: 6.7 h; wall time: 6.7 h; effective bandwidth: 0.38 GB/s (FP16)
     - MULTI-PASS KERNEL SPLIT
        The single fused kernel (all 3 pyramid levels in one) is split
@@ -21,7 +21,7 @@ v2: Multipass kernel split + warp-per-pixel
 
 
 
-v1: Pyramid search
+v1: Pyramid search (tbd_v1.cu)
     - Runtimes: kernel time: 12 h; wall time: 12 h; effective bandwidth: 0.21 GB/s (FP16)
     - COARSE-TO-FINE VELOCITY PYRAMID (~25-40x fewer velocity evals)
        - Level 0 (coarse):  step=0.50, 15x15 =  225 hypotheses/pixel
@@ -33,7 +33,7 @@ v1: Pyramid search
 
 
 
-v0.5: Memory optimizations
+v0.5: Memory optimizations (tbd_v0.5.cu)
     - Runtimes: kernel time: 9.3 h; wall time: 9.3 h; effective bandwidth: 4.05 GB/s (FP16)
     - FP16 FRAME STORAGE (halves memory footprint & bandwidth)
        Frames are stored as __half on device; each trajectory read
@@ -53,7 +53,7 @@ v0.5: Memory optimizations
 
 
 
-v0: Brute-Force method
+v0: Brute-Force method (tbd_v0.cu)
     - Runtimes: kernel time: > 1 day; wall time: > 1 day; effective bandwidth: < 0.1 GB/s (FP32)
     - Basic Stack-and-Shift method over all velocity hypothesis
     - 2D spatial parallelization over (x0, y0)
