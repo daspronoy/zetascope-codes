@@ -43,8 +43,8 @@
 #include <ctime>
 #include <chrono>
 #include <algorithm>
+#include <cstdint>
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
 
 // ============================================================
 // Error checking
@@ -88,6 +88,13 @@
 __constant__ float d_vel_L0[MAX_VEL_L0];
 __constant__ float d_vel_L1[MAX_VEL_L1];  // Relative offsets [0, 2*L1_RADIUS]
 __constant__ float d_vel_L2[MAX_VEL_L2];  // Relative offsets [0, 2*L2_RADIUS]
+
+// INT8 dequant scales: fp32 = u8 * g_frame_scale[t]
+// Stored in device global memory (not constant) so nf is unbounded.
+// All warp lanes read the same t simultaneously → L2 broadcast, same cost
+// as constant memory for this uniform-access pattern.
+__device__ float* g_frame_scale;
+
 __constant__ int   d_nv_L0;
 __constant__ int   d_nv_L1;
 __constant__ int   d_nv_L2;
@@ -99,10 +106,11 @@ __constant__ float d_v_max;
 
 // ============================================================
 // Device helper: evaluate one trajectory hypothesis
-// Reads FP16, accumulates in FP32 for precision
+// Reads INT8 (uint8_t), dequantizes with per-frame scale,
+// accumulates in FP32 for precision
 // ============================================================
 __device__ __forceinline__ float evaluate_trajectory(
-    const __half* __restrict__ frames,
+    const uint8_t* __restrict__ frames,
     int x0, int y0, float vx, float vy,
     int nx, int ny, int nf)
 {
@@ -116,7 +124,8 @@ __device__ __forceinline__ float evaluate_trajectory(
         if (px < 0 || px >= nx || py < 0 || py >= ny)
             return -FLT_MAX;
 
-        stat += __half2float(frames[(size_t)t * frame_stride + py * nx + px]);
+        stat += (float)__ldg(&frames[(size_t)t * frame_stride + py * nx + px])
+                * g_frame_scale[t];
     }
     return stat;
 }
@@ -178,66 +187,6 @@ __device__ void warp_topk_write(
 }
 
 // ============================================================
-// Kernel: Level-0 warp-per-pixel search  (Strategy 3 + 4)
-// ============================================================
-// Each warp (32 threads) owns one pixel. The nv0² velocity pairs
-// are striped across the 32 lanes: lane i handles pairs i, i+32, ...
-// Each lane tracks only its single local best (3 scalar registers).
-// warp_topk_write extracts the top-K into d_topk_L0 via shuffles.
-//
-// Register budget: ~20-25/thread  (vs ~100+ in old fused kernel)
-// ============================================================
-__global__ __launch_bounds__(32 * PIXELS_PER_BLOCK, 8)
-void tbd_warp_L0(
-    const __half* __restrict__ frames,
-    Candidate*    __restrict__ d_topk_L0)   // [n_pixels * TOP_K] output
-{
-    const int lane      = threadIdx.x;                            // 0..31
-    const int warp_id   = threadIdx.y;                            // 0..PIXELS_PER_BLOCK-1
-    const int pixel_idx = blockIdx.x * PIXELS_PER_BLOCK + warp_id;
-
-    const int nx = d_nx, ny = d_ny, nf = d_n_frames;
-    if (pixel_idx >= nx * ny) return;
-
-    const int x0 = pixel_idx % nx;
-    const int y0 = pixel_idx / nx;
-
-    // Per-pixel velocity bounds (prune trajectories leaving the FOV)
-    const float inv_T = 1.f / (float)(nf - 1);
-    const float vx_lo = fmaxf(d_v_min, -(float)x0 * inv_T);
-    const float vx_hi = fminf(d_v_max,  (float)(nx - 1 - x0) * inv_T);
-    const float vy_lo = fmaxf(d_v_min, -(float)y0 * inv_T);
-    const float vy_hi = fminf(d_v_max,  (float)(ny - 1 - y0) * inv_T);
-
-    const int nv0          = d_nv_L0;
-    const int n_vel_pairs  = nv0 * nv0;
-
-    // Each lane tracks its single local best — only 3 registers for topk
-    float local_stat = -FLT_MAX;
-    float local_vx   = 0.f;
-    float local_vy   = 0.f;
-
-    // Stripe velocity pairs across the 32 lanes
-    for (int vel_idx = lane; vel_idx < n_vel_pairs; vel_idx += 32) {
-        const float vx = d_vel_L0[vel_idx / nv0];
-        const float vy = d_vel_L0[vel_idx % nv0];
-
-        if (vx < vx_lo || vx > vx_hi || vy < vy_lo || vy > vy_hi) continue;
-
-        float stat = evaluate_trajectory(frames, x0, y0, vx, vy, nx, ny, nf);
-        if (stat > local_stat) {
-            local_stat = stat;
-            local_vx   = vx;
-            local_vy   = vy;
-        }
-    }
-
-    // Warp-shuffle top-K extraction → d_topk_L0
-    warp_topk_write(d_topk_L0 + pixel_idx * TOP_K,
-                    local_stat, local_vx, local_vy, lane);
-}
-
-// ============================================================
 // Kernel: Level-1 warp-per-pixel refinement  (Strategy 3 + 4)
 // ============================================================
 // Reads d_topk_L0 (TOP_K entries per pixel), searches an
@@ -250,7 +199,7 @@ void tbd_warp_L0(
 // ============================================================
 __global__ __launch_bounds__(32 * PIXELS_PER_BLOCK, 4)
 void tbd_warp_L1(
-    const __half*     __restrict__ frames,
+    const uint8_t*    __restrict__ frames,
     const Candidate*  __restrict__ d_topk_L0,   // input
     Candidate*        __restrict__ d_topk_L1)   // output
 {
@@ -320,7 +269,7 @@ void tbd_warp_L1(
 // ============================================================
 __global__ __launch_bounds__(32 * PIXELS_PER_BLOCK, 4)
 void tbd_warp_L2(
-    const __half*    __restrict__ frames,
+    const uint8_t*   __restrict__ frames,
     const Candidate* __restrict__ d_topk_L1,    // input
     float*           __restrict__ best_stats,   // [n_pixels] output
     float*           __restrict__ best_vx_out,
@@ -393,7 +342,82 @@ void tbd_warp_L2(
 }
 
 // ============================================================
-// Kernel: GPU-side argmax reduction
+// Kernel: Shift-and-Stack — L0 coarse search (velocity-outer)
+// ============================================================
+// For fixed (vx, vy), computes H[y,x] = Σ_t frame[t][y+vy*t][x+vx*t]
+// for all pixels simultaneously. Adjacent threads read adjacent columns
+// → fully coalesced 128-byte cache lines.
+// Frame data is INT8 (uint8_t); dequantized via g_frame_scale[t].
+// Register usage: ~6/thread. Launched once per (vx,vy) pair.
+// ============================================================
+__global__ void shift_and_accumulate(
+    const uint8_t* __restrict__ frames,
+    float* __restrict__ H,          // [ny × nx] output
+    float vx, float vy,
+    int nx, int ny, int nf)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= nx || y >= ny) return;
+
+    float acc = 0.f;
+    const int frame_stride = ny * nx;
+    for (int t = 0; t < nf; t++) {
+        int px = __float2int_rn(x + vx * t);
+        int py = __float2int_rn(y + vy * t);
+        if (px < 0 || px >= nx || py < 0 || py >= ny) { acc = -FLT_MAX; break; }
+        acc += (float)__ldg(&frames[(size_t)t * frame_stride + py * nx + px])
+               * g_frame_scale[t];
+    }
+    H[y * nx + x] = acc;
+}
+
+// ============================================================
+// Kernel: Initialize top-K candidate array to -FLT_MAX
+// ============================================================
+__global__ void init_topk(Candidate* __restrict__ topk, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { topk[i].stat = -FLT_MAX; topk[i].vx = 0.f; topk[i].vy = 0.f; }
+}
+
+// ============================================================
+// Kernel: Update per-pixel top-K from one shift image H
+// ============================================================
+// Called once per (vx,vy) pair after shift_and_accumulate.
+// Each thread owns one pixel; replaces the worst slot in its
+// TOP_K array if H[pixel] beats it.
+// ============================================================
+__global__ void topk_update_L0(
+    const float* __restrict__ H,
+    float vx, float vy,
+    Candidate* __restrict__ d_topk,
+    int n_pixels)
+{
+    int pid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pid >= n_pixels) return;
+
+    float s = H[pid];
+    if (s <= -FLT_MAX + 1.f) return;   // trajectory left FOV
+
+    Candidate* topk = d_topk + pid * TOP_K;
+    int min_k = 0;
+    for (int k = 1; k < TOP_K; k++)
+        if (topk[k].stat < topk[min_k].stat) min_k = k;
+    if (s > topk[min_k].stat) {
+        topk[min_k].stat = s;
+        topk[min_k].vx   = vx;
+        topk[min_k].vy   = vy;
+    }
+}
+
+// ============================================================
+// Kernel: GPU-side argmax reduction (warp-shuffle, no shared mem)
+// ============================================================
+// Uses warp-shuffle to reduce within each warp, then collects
+// warp winners into a 32-element shared buffer for the final
+// warp-level pass. Faster and more consistent than shared-mem
+// tree reduction (same approach as warp_topk_write in Strategy 4).
 // ============================================================
 __global__ void reduce_argmax(
     const float* __restrict__ stats,
@@ -405,38 +429,43 @@ __global__ void reduce_argmax(
     float* block_vy,
     int*   block_idx)
 {
-    extern __shared__ char smem[];
-    float* s_stats = (float*)smem;
-    int*   s_idx   = (int*)(s_stats + blockDim.x);
+    int tid  = threadIdx.x;
+    int gid  = blockIdx.x * blockDim.x + tid;
+    int lane = tid & 31;
+    int warp = tid >> 5;
 
-    int tid = threadIdx.x;
-    int gid = blockIdx.x * blockDim.x + tid;
+    float s   = (gid < n) ? stats[gid] : -FLT_MAX;
+    int   idx = (gid < n) ? gid        : -1;
 
-    if (gid < n) {
-        s_stats[tid] = stats[gid];
-        s_idx[tid]   = gid;
-    } else {
-        s_stats[tid] = -FLT_MAX;
-        s_idx[tid]   = -1;
+    // Warp-level reduce: keep max and its original index
+    for (int off = 16; off > 0; off >>= 1) {
+        float s2   = __shfl_down_sync(0xffffffff, s,   off);
+        int   idx2 = __shfl_down_sync(0xffffffff, idx, off);
+        if (s2 > s) { s = s2; idx = idx2; }
     }
+
+    // Collect one winner per warp into shared memory
+    __shared__ float s_warp_stats[32];
+    __shared__ int   s_warp_idx[32];
+    if (lane == 0) { s_warp_stats[warp] = s; s_warp_idx[warp] = idx; }
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            if (s_stats[tid + stride] > s_stats[tid]) {
-                s_stats[tid] = s_stats[tid + stride];
-                s_idx[tid]   = s_idx[tid + stride];
-            }
+    // Final pass: first warp reduces the warp winners
+    if (warp == 0) {
+        int nwarps = blockDim.x >> 5;
+        s   = (lane < nwarps) ? s_warp_stats[lane] : -FLT_MAX;
+        idx = (lane < nwarps) ? s_warp_idx[lane]   : -1;
+        for (int off = 16; off > 0; off >>= 1) {
+            float s2   = __shfl_down_sync(0xffffffff, s,   off);
+            int   idx2 = __shfl_down_sync(0xffffffff, idx, off);
+            if (s2 > s) { s = s2; idx = idx2; }
         }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        block_stats[blockIdx.x] = s_stats[0];
-        block_idx[blockIdx.x]   = s_idx[0];
-        int best = s_idx[0];
-        block_vx[blockIdx.x]    = (best >= 0 && best < n) ? vx_arr[best] : 0.0f;
-        block_vy[blockIdx.x]    = (best >= 0 && best < n) ? vy_arr[best] : 0.0f;
+        if (lane == 0) {
+            block_stats[blockIdx.x] = s;
+            block_idx[blockIdx.x]   = idx;
+            block_vx[blockIdx.x]    = (idx >= 0 && idx < n) ? vx_arr[idx] : 0.0f;
+            block_vy[blockIdx.x]    = (idx >= 0 && idx < n) ? vy_arr[idx] : 0.0f;
+        }
     }
 }
 
@@ -578,8 +607,8 @@ int main(int argc, char** argv) {
     printf("  Frames         : %d\n", nf);
     printf("  Total traj     : %.2f billion (vs %.1f B brute-force)\n",
            total_traj / 1e9, (double)n_pixels * brute_evals / 1e9);
-    printf("  Frame data     : %.2f GB (FP16)\n",
-           (double)n_pixels * nf * sizeof(__half) / 1e9);
+    printf("  Frame data     : %.2f GB (INT8)\n",
+           (double)n_pixels * nf * sizeof(uint8_t) / 1e9);
     printf("  TopK buffers   : %.2f MB (d_topk_L0 + d_topk_L1)\n",
            2.0 * n_pixels * TOP_K * sizeof(Candidate) / 1e6);
     printf("\n");
@@ -598,17 +627,19 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_v_max,    &v_max,   sizeof(float)));
 
     // --- Allocate device memory ---
-    size_t frame_bytes = (size_t)n_pixels * nf * sizeof(__half);
+    size_t frame_bytes = (size_t)n_pixels * nf * sizeof(uint8_t);
     size_t stat_bytes  = (size_t)n_pixels * sizeof(float);
     size_t topk_bytes  = (size_t)n_pixels * TOP_K * sizeof(Candidate);
 
     printf("Allocating %.2f GB on GPU...\n",
-           (frame_bytes + 3 * stat_bytes + 2 * topk_bytes) / 1e9);
+           (frame_bytes + 4 * stat_bytes + 2 * topk_bytes) / 1e9);
 
-    __half*    d_frames;
+    uint8_t*   d_frames;
     float*     d_best_stats;
     float*     d_best_vx;
     float*     d_best_vy;
+    float*     d_H;         // shift-and-stack intermediate image
+    float*     d_scale_arr; // per-frame INT8 dequant scales (device global memory)
     Candidate* d_topk_L0;
     Candidate* d_topk_L1;
 
@@ -616,23 +647,41 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_best_stats, stat_bytes));
     CUDA_CHECK(cudaMalloc(&d_best_vx,    stat_bytes));
     CUDA_CHECK(cudaMalloc(&d_best_vy,    stat_bytes));
+    CUDA_CHECK(cudaMalloc(&d_H,          stat_bytes));
+    CUDA_CHECK(cudaMalloc(&d_scale_arr,  nf * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_topk_L0,    topk_bytes));
     CUDA_CHECK(cudaMalloc(&d_topk_L1,    topk_bytes));
     printf("Allocated successfully.\n\n");
 
-    // --- Convert FP32 → FP16 and upload ---
-    printf("Converting FP32 -> FP16 and uploading to GPU...\n");
+    // --- Convert FP32 → INT8 (per-frame linear scale) and upload ---
+    printf("Converting FP32 -> INT8 (per-frame scale) and uploading to GPU...\n");
     auto up_t0 = std::chrono::steady_clock::now();
 
     size_t n_total = (size_t)n_pixels * nf;
-    __half* h_frames_fp16 = (__half*)malloc(frame_bytes);
-    for (size_t i = 0; i < n_total; i++)
-        h_frames_fp16[i] = __float2half(h_frames_fp32[i]);
+    float*   h_frame_scales = (float*)malloc(nf * sizeof(float));
+    uint8_t* h_frames_u8    = (uint8_t*)malloc(n_total);
+
+    // Per-frame: find max, compute scale, quantize to [0, 255].
+    // Assumes non-negative frame values (radar/optical intensity).
+    for (int t = 0; t < nf; t++) {
+        const float* src = h_frames_fp32 + (size_t)t * n_pixels;
+        float max_val = 1e-30f;
+        for (int i = 0; i < n_pixels; i++)
+            max_val = fmaxf(max_val, src[i]);
+        float scale = max_val / 255.0f;
+        h_frame_scales[t] = scale;
+        uint8_t* dst = h_frames_u8 + (size_t)t * n_pixels;
+        for (int i = 0; i < n_pixels; i++)
+            dst[i] = (uint8_t)fminf(255.f, fmaxf(0.f, roundf(src[i] / scale)));
+    }
     free(h_frames_fp32);
     h_frames_fp32 = nullptr;
 
-    CUDA_CHECK(cudaMemcpy(d_frames, h_frames_fp16, frame_bytes, cudaMemcpyHostToDevice));
-    free(h_frames_fp16);
+    CUDA_CHECK(cudaMemcpy(d_frames,    h_frames_u8,    frame_bytes,        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scale_arr, h_frame_scales, nf * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_frame_scale, &d_scale_arr, sizeof(float*)));
+    free(h_frames_u8);
+    free(h_frame_scales);
 
     auto up_t1 = std::chrono::steady_clock::now();
     double up_ms = std::chrono::duration<double, std::milli>(up_t1 - up_t0).count();
@@ -649,22 +698,45 @@ int main(int argc, char** argv) {
     const dim3 block(32, PIXELS_PER_BLOCK);
     const int  n_warp_blocks = (n_pixels + PIXELS_PER_BLOCK - 1) / PIXELS_PER_BLOCK;
 
-    printf("[Phase 2] Pyramid search — 3 warp-per-pixel kernels\n");
-    printf("  Block: (32 lanes × %d pixels) = %d threads\n",
+    printf("[Phase 2] Pyramid search — L0 shift-and-stack, L1/L2 warp-per-pixel\n");
+    printf("  L1/L2 block: (32 lanes × %d pixels) = %d threads\n",
            PIXELS_PER_BLOCK, 32 * PIXELS_PER_BLOCK);
-    printf("  Grid : %d blocks (%d pixels total)\n\n", n_warp_blocks, n_pixels);
+    printf("  L1/L2 grid : %d blocks (%d pixels total)\n\n", n_warp_blocks, n_pixels);
 
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
     CUDA_CHECK(cudaEventCreate(&t1));
 
-    // -- L0: coarse warp search --
-    printf("  [L0] Coarse search  (%d x %d = %lld pairs/pixel, "
-           "ceil(%lld/32) iters/lane)...\n",
-           nv0, nv0, evals_L0, evals_L0);
+    // -- L0: shift-and-stack coarse search --
+    printf("  [L0] Coarse search (shift-and-stack, %d x %d = %lld pairs)...\n",
+           nv0, nv0, evals_L0);
     CUDA_CHECK(cudaEventRecord(t0));
-    tbd_warp_L0<<<n_warp_blocks, block>>>(d_frames, d_topk_L0);
-    CUDA_CHECK(cudaGetLastError());
+
+    {
+        int init_n = n_pixels * TOP_K;
+        int init_block = 256;
+        int init_grid  = (init_n + init_block - 1) / init_block;
+        init_topk<<<init_grid, init_block>>>(d_topk_L0, init_n);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    {
+        dim3 sas_block(32, 8);
+        dim3 sas_grid((nx + 31) / 32, (ny + 7) / 8);
+        int  upd_block = 256;
+        int  upd_grid  = (n_pixels + upd_block - 1) / upd_block;
+
+        for (int vi = 0; vi < nv0; vi++) {
+            for (int vj = 0; vj < nv0; vj++) {
+                shift_and_accumulate<<<sas_grid, sas_block>>>(
+                    d_frames, d_H, h_vel_L0[vi], h_vel_L0[vj], nx, ny, nf);
+                topk_update_L0<<<upd_grid, upd_block>>>(
+                    d_H, h_vel_L0[vi], h_vel_L0[vj], d_topk_L0, n_pixels);
+            }
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     CUDA_CHECK(cudaEventRecord(t1));
     CUDA_CHECK(cudaEventSynchronize(t1));
     float l0_ms;
@@ -717,8 +789,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_blk_vy,    red_grid * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_blk_idx,   red_grid * sizeof(int)));
 
-    size_t smem_size = red_block * (sizeof(float) + sizeof(int));
-    reduce_argmax<<<red_grid, red_block, smem_size>>>(
+    reduce_argmax<<<red_grid, red_block>>>(
         d_best_stats, d_best_vx, d_best_vy,
         n_pixels, d_blk_stats, d_blk_vx, d_blk_vy, d_blk_idx);
     CUDA_CHECK(cudaGetLastError());
@@ -768,7 +839,7 @@ int main(int argc, char** argv) {
 
     printf("  Timing:\n");
     printf("    Data loading    : %.2f s\n", load_ms / 1000.0);
-    printf("    FP16 conversion : %.2f s\n", up_ms / 1000.0);
+    printf("    INT8 conversion : %.2f s\n", up_ms / 1000.0);
     printf("    L0 warp kernel  : %.2f ms  [~20-25 regs/thread]\n", l0_ms);
     printf("    L1 warp kernel  : %.2f ms  [~35-40 regs/thread]\n", l1_ms);
     printf("    L2 warp kernel  : %.2f ms  [~35-40 regs/thread]\n", l2_ms);
@@ -780,16 +851,16 @@ int main(int argc, char** argv) {
            total_traj / (total_search_ms * 1e6));
     printf("    %.2f trillion pixel reads / s\n",
            total_reads / (total_search_ms * 1e9));
-    printf("    Effective BW: %.2f GB/s (FP16 reads)\n",
-           total_reads * sizeof(__half) / (total_search_ms * 1e6));
+    printf("    Effective BW: %.2f GB/s (INT8 reads)\n",
+           total_reads * sizeof(uint8_t) / (total_search_ms * 1e6));
     printf("\n");
     printf("  Pyramid efficiency:\n");
     printf("    Velocity evals/pixel : %lld (vs %lld brute-force)\n",
            total_evals, brute_evals);
     printf("    Reduction factor     : %.1fx\n",
            (double)brute_evals / total_evals);
-    printf("    Memory saved (FP16)  : %.1f GB\n",
-           (double)n_pixels * nf * (sizeof(float) - sizeof(__half)) / 1e9);
+    printf("    Memory saved (INT8)  : %.1f GB\n",
+           (double)n_pixels * nf * (sizeof(float) - sizeof(uint8_t)) / 1e9);
     printf("================================================================\n");
 
     // --- Cleanup ---
@@ -798,6 +869,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_best_stats));
     CUDA_CHECK(cudaFree(d_best_vx));
     CUDA_CHECK(cudaFree(d_best_vy));
+    CUDA_CHECK(cudaFree(d_H));
+    CUDA_CHECK(cudaFree(d_scale_arr));
     CUDA_CHECK(cudaFree(d_topk_L0));
     CUDA_CHECK(cudaFree(d_topk_L1));
     CUDA_CHECK(cudaFree(d_blk_stats));
