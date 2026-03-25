@@ -1,39 +1,42 @@
 /**
- * Orin-Optimized TBD with Coarse-to-Fine Velocity Pyramid
+ * TBD v3 — Coarse-to-Fine Velocity Pyramid
  * =========================================================
  *
- *   1. STRATEGY 3: MULTI-PASS KERNEL SPLIT
- *      The single fused kernel (all 3 pyramid levels in one) is split
- *      into three separate kernels with global-memory intermediates:
- *        tbd_warp_L0  → writes d_topk_L0[n_pixels × TOP_K]
- *        tbd_warp_L1  → reads d_topk_L0, writes d_topk_L1
- *        tbd_warp_L2  → reads d_topk_L1, writes best_stats/vx/vy
- *      Each kernel holds only its own level's state in registers,
- *      cutting register pressure roughly in half per kernel vs the
- *      fused version, improving SM occupancy ~1.5-2x per kernel.
+ *  CHANGE 1: INT8 frame storage
+ *    Frames stored as uint8_t (was FP16). Per-frame linear scale:
+ *      scale[t] = max_val_in_frame[t] / 255.0
+ *      dequant : fp32 = u8 * scale[t]
+ *    Scales held in device global memory via __device__ float* g_frame_scale
+ *    (not constant memory, so frame count is unbounded). All warp lanes read
+ *    the same scale[t] per loop iteration → L2 broadcast, no penalty vs
+ *    constant memory. Halves memory traffic vs FP16.
+ *    Assumes non-negative frame values (radar/optical intensity).
  *
- *   2. STRATEGY 4: WARP-PER-PIXEL
- *      One warp (32 threads) is assigned to each pixel. The velocity
- *      search space for that pixel is partitioned across the 32 lanes:
- *        lane i handles velocity indices i, i+32, i+64, ...
- *      Each thread tracks only 1 local best (3 scalar registers) rather
- *      than a topk[TOP_K] array (15 registers). After the inner loop, a
- *      warp-shuffle top-K extraction writes the results to global memory.
+ *  CHANGE 2: L0 shift-and-stack (velocity-outer, pixel-inner)
+ *    Replaces the old warp-per-pixel L0 search. For each (vx, vy) pair:
+ *      shift_and_accumulate  — one thread per pixel computes
+ *                              H[y,x] = Σ_t frame[t][y+vy*t][x+vx*t]
+ *                              Adjacent threads read adjacent columns
+ *                              → fully coalesced 128-byte cache lines
+ *                              (~6 registers/thread, ~1% vs ~64× waste before)
+ *      topk_update_L0        — one thread per pixel inserts H[pixel]
+ *                              into that pixel's TOP_K candidate list
+ *    Launched nv0² times (one per coarse velocity pair) with init_topk
+ *    initialising d_topk_L0 to -FLT_MAX before the loop.
  *
- *      Combined effect of Strategy 3 + 4:
- *        Old fused kernel:  ~100+ registers/thread  →  ~12% occupancy
- *        L0 warp kernel:    ~20-25 registers/thread →  ~75% occupancy
- *        L1/L2 warp kernel: ~35-40 registers/thread →  ~50% occupancy
- *      Expected improvement: 2-4x over the fused baseline.
+ *  L1 / L2: unchanged — warp-per-pixel (Strategy 3 + 4)
+ *    tbd_warp_L1  reads d_topk_L0, writes d_topk_L1
+ *    tbd_warp_L2  reads d_topk_L1, writes best_stats/vx/vy
+ *    Per-level register budgets: L1/L2 ~35-40/thread → ~50% occupancy
  *
- * Compile (Orin):
- *   nvcc -O3 -arch=sm_87 --use_fast_math -o tbd_orin tbd_orin_optimized_v2.cu
+ * Compile (Orin, sm_87):
+ *   nvcc -O3 -arch=sm_87 --use_fast_math -o tbd_v3 tbd_v3.cu
  *
- * Compile (dev on RTX 4090 for testing):
- *   nvcc -O3 -arch=sm_89 --use_fast_math -o tbd_orin tbd_orin_optimized_v2.cu
+ * Compile (RTX 4090, sm_89):
+ *   nvcc -O3 -arch=sm_89 --use_fast_math -o tbd_v3 tbd_v3.cu
  *
  * Run:
- *   ./tbd_orin tbd_frames.bin tbd_params.bin
+ *   ./tbd_v3 tbd_frames.bin tbd_params.bin
  */
 
 #include <cstdio>
