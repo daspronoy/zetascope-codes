@@ -1,5 +1,31 @@
 Changelogs:
 
+
+v3: INT8 quantization + flip shift-and-stack (tbd_v3.cu)
+    - Runtimes: kernel time: 5.3 h; wall time: 5.3 h; effective bandwidth: 0.24 GB/s (INT8)
+    - INT8 frame storage
+     Frames stored as uint8_t (was FP16). Per-frame linear scale:
+       scale[t] = max_val_in_frame[t] / 255.0
+       dequant : fp32 = u8 * scale[t]
+     Scales held in device global memory via __device__ float* g_frame_scale
+     (not constant memory, so frame count is unbounded). All warp lanes read
+     the same scale[t] per loop iteration → L2 broadcast, no penalty vs
+     constant memory. Halves memory traffic vs FP16.
+     Assumes non-negative frame values (radar/optical intensity).
+ 
+    - L0 shift-and-stack (velocity-outer, pixel-inner)
+     Replaces the old warp-per-pixel L0 search. For each (vx, vy) pair:
+       shift_and_accumulate  — one thread per pixel computes
+                               H[y,x] = Σ_t frame[t][y+vy*t][x+vx*t]
+                               Adjacent threads read adjacent columns
+                               → fully coalesced 128-byte cache lines
+                               (~6 registers/thread, ~1% vs ~64× waste before)
+       topk_update_L0        — one thread per pixel inserts H[pixel]
+                               into that pixel's TOP_K candidate list
+     Launched nv0² times (one per coarse velocity pair) with init_topk
+     initialising d_topk_L0 to -FLT_MAX before the loop.
+
+
 v2: Multipass kernel split + warp-per-pixel (tbd_v2.cu)
     - Runtimes: kernel time: 6.7 h; wall time: 6.7 h; effective bandwidth: 0.38 GB/s (FP16)
     - MULTI-PASS KERNEL SPLIT
@@ -18,6 +44,7 @@ v2: Multipass kernel split + warp-per-pixel (tbd_v2.cu)
        Each thread tracks only 1 local best (3 scalar registers) rather
        than a topk[TOP_K] array (15 registers). After the inner loop, a
        warp-shuffle top-K extraction writes the results to global memory.
+    - Min stacked SNR: ~35
 
 
 
@@ -30,6 +57,7 @@ v1: Pyramid search (tbd_v1.cu)
     - BOUNDS-AWARE TRAJECTORY PRUNING
        Pre-compute valid velocity range per pixel to skip
        trajectories that immediately exit the FOV.
+    - Min stacked SNR: ~35
 
 
 
@@ -49,8 +77,7 @@ v0.5: Memory optimizations (tbd_v0.5.cu)
        The per-pixel best-score array is reduced entirely on the GPU.
        Only ~10K block-level results are copied to host, avoiding a
        large device-to-host transfer for the full n_pixels array.
-    - Works even for per-frame SNR below 1.
-
+    - Works for stacked SNR = 8.
 
 
 v0: Brute-Force method (tbd_v0.cu)
@@ -59,7 +86,7 @@ v0: Brute-Force method (tbd_v0.cu)
     - 2D spatial parallelization over (x0, y0)
     - Per-thread local accumulation with register-level tracking
     - Two-stage reduction: per-pixel best → global best
-    - Works even for per-frame SNR below 1.
+    - Works for stacked SNR = 8.
 
 
 
@@ -71,4 +98,4 @@ Benchmark parameters (Jetson Orin)
 Resolution: 3072 x 3072 pixels (~9.4 MP)
 Number of frames: 300
 Brute-force velocity hypothesis baseline: 24025
-SNR (per frame): 2.5
+SNR (stacked): 43
