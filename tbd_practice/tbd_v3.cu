@@ -66,8 +66,8 @@
 // Level 0 (coarse): step=0.50, covers full range, 15x15 = 225 pairs
 #define L0_STEP     0.50f
 // Level 1 (medium): step=0.10, +/-0.50 around L0 winners, 11x11 = 121 pairs
-#define L1_STEP     0.10f
-#define L1_RADIUS   0.50f
+#define L1_STEP     0.20f
+#define L1_RADIUS   0.80f
 // Level 2 (fine):   step=0.05, +/-0.10 around L1 winners, 5x5 = 25 pairs
 #define L2_STEP     0.05f
 #define L2_RADIUS   0.10f
@@ -79,7 +79,7 @@
 // blockDim = (32, PIXELS_PER_BLOCK) = 128 threads/block at PIXELS_PER_BLOCK=4.
 // Tunable: larger values improve block-level efficiency but may hurt
 // occupancy if register file per block grows too large.
-#define PIXELS_PER_BLOCK  4
+#define PIXELS_PER_BLOCK  8
 
 // ============================================================
 // Constant memory for velocity grids at each pyramid level
