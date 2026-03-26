@@ -3,15 +3,15 @@
 #   sm_70 = V100 (Volta), sm_75 = T4 (Turing), sm_80 = A100 (Ampere), sm_86 = RTX 3090 (Ampere), sm_89 = RTX 4090 (Ada Lovelace), sm_87 = Jetson Orin (Ampere), sm_120 = 5070Ti (Blackwell)
 
 NVCC      = nvcc
-NVCCFLAGS = -O3 -arch=sm_120 --use_fast_math -lineinfo --allow-unsupported-compiler
-TARGET    = tbd_v4
+NVCCFLAGS = -O3 -arch=sm_87 --use_fast_math -lineinfo --allow-unsupported-compiler
+TARGET    = tbd_v3
 # TARGET    = tbd_solution
 
 .PHONY: all clean data run
 
 all: $(TARGET)
 
-$(TARGET): tbd_v4.cu
+$(TARGET): tbd_v3.cu
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 # Generate test data using Python

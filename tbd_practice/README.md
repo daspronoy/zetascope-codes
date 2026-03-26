@@ -2,7 +2,8 @@ Changelogs:
 
 
 v3: INT8 quantization + flip shift-and-stack (tbd_v3.cu)
-    - Runtimes: kernel time: 5.3 h; wall time: 5.3 h; effective bandwidth: 0.24 GB/s (INT8)
+    - Runtimes: kernel time: 4.3 h; wall time: 4.3 h; effective bandwidth: 0.24 GB/s (INT8)
+    - SNR (stacked): 24.25
     - INT8 frame storage
      Frames stored as uint8_t (was FP16). Per-frame linear scale:
        scale[t] = max_val_in_frame[t] / 255.0

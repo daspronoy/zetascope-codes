@@ -73,7 +73,7 @@
 #define L2_RADIUS   0.10f
 
 // How many top candidates to carry between pyramid levels
-#define TOP_K       10
+#define TOP_K       6
 
 // Strategy 4: number of pixels (warps) packed into one thread block.
 // blockDim = (32, PIXELS_PER_BLOCK) = 128 threads/block at PIXELS_PER_BLOCK=4.
