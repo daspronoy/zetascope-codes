@@ -1,5 +1,10 @@
 Changelogs:
 
+v4: Boundary-tightened pixel exclusion
+    - Runtimes: kernel time: 2.2 h; wall time: 2.2 h; effective bandwidth: 0.24 GB/s (INT8)
+    - pixels within margin = ceil(v_max*(nf-1)) of any edge are skipped at
+      all three levels. Those pixels cannot anchor a full trajectory at maximum speed without
+      leaving the FOV; their trajectories always return -FLT_MAX regardless of velocity tested.
 
 v3: INT8 quantization + flip shift-and-stack (tbd_v3.cu)
     - Runtimes: kernel time: 2.2 h; wall time: 2.2 h; effective bandwidth: 0.24 GB/s (INT8)

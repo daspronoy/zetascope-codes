@@ -1,43 +1,14 @@
-/**
- * TBD v4 — Coarse-to-Fine Velocity Pyramid
- * =========================================================
- *
- *  CHANGE 1: INT8 frame storage
- *    Frames stored as uint8_t (was FP16). Per-frame linear scale:
- *      scale[t] = max_val_in_frame[t] / 255.0
- *      dequant : fp32 = u8 * scale[t]
- *    Scales held in device global memory via __device__ float* g_frame_scale
- *    (not constant memory, so frame count is unbounded). All warp lanes read
- *    the same scale[t] per loop iteration → L2 broadcast, no penalty vs
- *    constant memory. Halves memory traffic vs FP16.
- *    Assumes non-negative frame values (radar/optical intensity).
- *
- *  CHANGE 2: L0 shift-and-stack (velocity-outer, pixel-inner)
- *    Replaces the old warp-per-pixel L0 search. For each (vx, vy) pair:
- *      shift_and_accumulate  — one thread per pixel computes
- *                              H[y,x] = Σ_t frame[t][y+vy*t][x+vx*t]
- *                              Adjacent threads read adjacent columns
- *                              → fully coalesced 128-byte cache lines
- *                              (~6 registers/thread, ~1% vs ~64× waste before)
- *      topk_update_L0        — one thread per pixel inserts H[pixel]
- *                              into that pixel's TOP_K candidate list
- *    Launched nv0² times (one per coarse velocity pair) with init_topk
- *    initialising d_topk_L0 to -FLT_MAX before the loop.
- *
- *  L1 / L2: unchanged — warp-per-pixel (Strategy 3 + 4)
- *    tbd_warp_L1  reads d_topk_L0, writes d_topk_L1
- *    tbd_warp_L2  reads d_topk_L1, writes best_stats/vx/vy
- *    Per-level register budgets: L1/L2 ~35-40/thread → ~50% occupancy
- *
- * Compile (Orin, sm_87):
- *   nvcc -O3 -arch=sm_87 --use_fast_math -o tbd_v3 tbd_v3.cu
- *
- * Compile (RTX 4090, sm_89):
- *   nvcc -O3 -arch=sm_89 --use_fast_math -o tbd_v3 tbd_v3.cu
- *
- * Run:
- *   ./tbd_v3 tbd_frames.bin tbd_params.bin
- */
+// TBD v4 — three-level coarse-to-fine velocity pyramid with boundary-tightened pixel exclusion.
+//
+// L0: shift_and_accumulate (one thread/pixel, velocity-outer loop) builds a stacked-image H
+//     for each (vx,vy) pair; topk_update_L0 inserts H[pixel] into a per-pixel TOP_K list.
+// L1: warp-per-pixel refinement around each L0 winner within ±L1_RADIUS at L1_STEP.
+// L2: warp-per-pixel fine search around each L1 winner within ±L2_RADIUS at L2_STEP.
+//
+// Boundary exclusion: pixels within margin = ceil(v_max*(nf-1)) of any edge are skipped at
+// all three levels. Those pixels cannot anchor a full trajectory at maximum speed without
+// leaving the FOV; their trajectories always return -FLT_MAX regardless of velocity tested.
+// Run: ./tbd_v4 tbd_frames.bin tbd_params.bin
 
 #include <cstdio>
 #include <cstdlib>
@@ -112,6 +83,10 @@ __constant__ int   d_nx;
 __constant__ int   d_ny;
 __constant__ float d_v_min;
 __constant__ float d_v_max;
+// Boundary margin: pixels within this many pixels of the edge cannot
+// support any trajectory at v_max over nf-1 steps without leaving the FOV.
+// margin = ceil(v_max * (nf - 1))
+__constant__ int   d_margin;
 
 // ============================================================
 // Device helper: evaluate one trajectory hypothesis
@@ -232,6 +207,20 @@ void tbd_warp_L1(
     const int x0 = pixel_idx % nx;
     const int y0 = pixel_idx / nx;
 
+    // Boundary exclusion: skip pixels that cannot support any full trajectory.
+    // All 32 lanes share the same pixel_idx → uniform branch, no divergence.
+    if (x0 < d_margin || x0 >= nx - d_margin || y0 < d_margin || y0 >= ny - d_margin) {
+        if (lane == 0) {
+            Candidate* out = d_topk_L1 + pixel_idx * TOP_K;
+            for (int k = 0; k < TOP_K; k++) {
+                out[k].stat = -FLT_MAX;
+                out[k].vx   = 0.f;
+                out[k].vy   = 0.f;
+            }
+        }
+        return;
+    }
+
     const float inv_T = 1.f / (float)(nf - 1);
     const float vx_lo = fmaxf(d_v_min, -(float)x0 * inv_T);
     const float vx_hi = fminf(d_v_max,  (float)(nx - 1 - x0) * inv_T);
@@ -303,6 +292,17 @@ void tbd_warp_L2(
 
     const int x0 = pixel_idx % nx;
     const int y0 = pixel_idx / nx;
+
+    // Boundary exclusion: skip pixels that cannot support any full trajectory.
+    // All 32 lanes share the same pixel_idx → uniform branch, no divergence.
+    if (x0 < d_margin || x0 >= nx - d_margin || y0 < d_margin || y0 >= ny - d_margin) {
+        if (lane == 0) {
+            best_stats[pixel_idx]  = -FLT_MAX;
+            best_vx_out[pixel_idx] = 0.f;
+            best_vy_out[pixel_idx] = 0.f;
+        }
+        return;
+    }
 
     const float inv_T = 1.f / (float)(nf - 1);
     const float vx_lo = fmaxf(d_v_min, -(float)x0 * inv_T);
@@ -383,6 +383,10 @@ __global__ void shift_and_accumulate(
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= nx || y >= ny) return;
+    if (x < d_margin || x >= nx - d_margin || y < d_margin || y >= ny - d_margin) {
+        H[y * nx + x] = -FLT_MAX;
+        return;
+    }
 
     const int frame_stride = ny * nx;
     float acc = 0.f;
@@ -601,6 +605,23 @@ int main(int argc, char** argv) {
 
     int n_pixels = nx * ny;
 
+    // Boundary-tightened pixel exclusion:
+    // A pixel can only anchor a valid trajectory at all velocities in
+    // [-v_max, +v_max] if its distance from every edge >= v_max * (nf-1).
+    // Pixels inside the margin band cannot complete a full trajectory without
+    // leaving the FOV at maximum speed and are excluded from TBD processing.
+    int margin = (int)ceilf(fabsf(v_max) * (float)(nf - 1));
+    int inner_nx    = nx - 2 * margin;
+    int inner_ny    = ny - 2 * margin;
+    int n_inner     = (inner_nx > 0 && inner_ny > 0) ? inner_nx * inner_ny : 0;
+    float pct_inner = 100.f * (float)n_inner / (float)n_pixels;
+    printf("Boundary margin: %d px (v_max=%.2f, nf=%d)\n", margin, v_max, nf);
+    printf("  Excluded border band : %d px wide on each side\n", margin);
+    printf("  Interior pixels      : %d x %d = %d  (%.1f%% of %d total)\n",
+           inner_nx, inner_ny, n_inner, pct_inner, n_pixels);
+    printf("  Margin pixels skipped: %d  (%.1f%%)\n\n",
+           n_pixels - n_inner, 100.f - pct_inner);
+
     // --- Build velocity grids ---
     float h_vel_L0[MAX_VEL_L0], h_vel_L1[MAX_VEL_L1], h_vel_L2[MAX_VEL_L2];
 
@@ -657,6 +678,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_ny,       &ny,      sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_v_min,    &v_min,   sizeof(float)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_v_max,    &v_max,   sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_margin,   &margin,  sizeof(int)));
 
     // --- Allocate device memory ---
     size_t frame_bytes = (size_t)n_pixels * nf * sizeof(uint8_t);
@@ -935,6 +957,12 @@ int main(int argc, char** argv) {
            (double)brute_evals / total_evals);
     printf("    Memory saved (INT8)  : %.1f GB\n",
            (double)n_pixels * nf * (sizeof(float) - sizeof(uint8_t)) / 1e9);
+    printf("  Boundary exclusion:\n");
+    printf("    Margin               : %d px\n", margin);
+    printf("    Interior pixels      : %d / %d  (%.1f%%)\n",
+           n_inner, n_pixels, pct_inner);
+    printf("    Traj skipped (L0)    : %.2f billion\n",
+           (double)(n_pixels - n_inner) * evals_L0 / 1e9);
     printf("================================================================\n");
 
     // --- Cleanup ---
