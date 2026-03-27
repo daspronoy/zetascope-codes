@@ -99,4 +99,5 @@ Benchmark parameters (Jetson Orin)
 Resolution: 3072 x 3072 pixels (~9.4 MP)
 Number of frames: 300
 Brute-force velocity hypothesis baseline: 24025
-SNR (stacked): 43
+SNR (stacked, for v1 and v2): 43
+SNR (stacked, v3 onwards): 24.25
