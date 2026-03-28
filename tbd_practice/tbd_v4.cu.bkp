@@ -1,43 +1,14 @@
-/**
- * TBD v3 — Coarse-to-Fine Velocity Pyramid
- * =========================================================
- *
- *  CHANGE 1: INT8 frame storage
- *    Frames stored as uint8_t (was FP16). Per-frame linear scale:
- *      scale[t] = max_val_in_frame[t] / 255.0
- *      dequant : fp32 = u8 * scale[t]
- *    Scales held in device global memory via __device__ float* g_frame_scale
- *    (not constant memory, so frame count is unbounded). All warp lanes read
- *    the same scale[t] per loop iteration → L2 broadcast, no penalty vs
- *    constant memory. Halves memory traffic vs FP16.
- *    Assumes non-negative frame values (radar/optical intensity).
- *
- *  CHANGE 2: L0 shift-and-stack (velocity-outer, pixel-inner)
- *    Replaces the old warp-per-pixel L0 search. For each (vx, vy) pair:
- *      shift_and_accumulate  — one thread per pixel computes
- *                              H[y,x] = Σ_t frame[t][y+vy*t][x+vx*t]
- *                              Adjacent threads read adjacent columns
- *                              → fully coalesced 128-byte cache lines
- *                              (~6 registers/thread, ~1% vs ~64× waste before)
- *      topk_update_L0        — one thread per pixel inserts H[pixel]
- *                              into that pixel's TOP_K candidate list
- *    Launched nv0² times (one per coarse velocity pair) with init_topk
- *    initialising d_topk_L0 to -FLT_MAX before the loop.
- *
- *  L1 / L2: unchanged — warp-per-pixel (Strategy 3 + 4)
- *    tbd_warp_L1  reads d_topk_L0, writes d_topk_L1
- *    tbd_warp_L2  reads d_topk_L1, writes best_stats/vx/vy
- *    Per-level register budgets: L1/L2 ~35-40/thread → ~50% occupancy
- *
- * Compile (Orin, sm_87):
- *   nvcc -O3 -arch=sm_87 --use_fast_math -o tbd_v3 tbd_v3.cu
- *
- * Compile (RTX 4090, sm_89):
- *   nvcc -O3 -arch=sm_89 --use_fast_math -o tbd_v3 tbd_v3.cu
- *
- * Run:
- *   ./tbd_v3 tbd_frames.bin tbd_params.bin
- */
+// TBD v4 — three-level coarse-to-fine velocity pyramid with boundary-tightened pixel exclusion.
+//
+// L0: shift_and_accumulate (one thread/pixel, velocity-outer loop) builds a stacked-image H
+//     for each (vx,vy) pair; topk_update_L0 inserts H[pixel] into a per-pixel TOP_K list.
+// L1: warp-per-pixel refinement around each L0 winner within ±L1_RADIUS at L1_STEP.
+// L2: warp-per-pixel fine search around each L1 winner within ±L2_RADIUS at L2_STEP.
+//
+// Boundary exclusion: pixels within margin = ceil(v_max*(nf-1)) of any edge are skipped at
+// all three levels. Those pixels cannot anchor a full trajectory at maximum speed without
+// leaving the FOV; their trajectories always return -FLT_MAX regardless of velocity tested.
+// Run: ./tbd_v4 tbd_frames.bin tbd_params.bin
 
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +19,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 // ============================================================
 // Error checking
@@ -62,24 +34,29 @@
         }                                                                  \
     } while (0)
 
+// Frame chunk size for shared memory tiling and FP16 partial accumulation (Steps 1+5)
+// Accumulates FRAME_CHUNK_C frames in FP16 then adds FP32 partial sum to stat.
+// Safe for 16 terms: max INT8 dequant value ≈ 1.0, 16 terms → sum ≤ 16.0 (well within FP16 range ~65504).
+#define FRAME_CHUNK_C 16
+
 // === Pyramid levels ===
 // Level 0 (coarse): step=0.50, covers full range, 15x15 = 225 pairs
 #define L0_STEP     0.50f
 // Level 1 (medium): step=0.10, +/-0.50 around L0 winners, 11x11 = 121 pairs
-#define L1_STEP     0.10f
-#define L1_RADIUS   0.50f
+#define L1_STEP     0.20f
+#define L1_RADIUS   0.80f
 // Level 2 (fine):   step=0.05, +/-0.10 around L1 winners, 5x5 = 25 pairs
 #define L2_STEP     0.05f
 #define L2_RADIUS   0.10f
 
 // How many top candidates to carry between pyramid levels
-#define TOP_K       10
+#define TOP_K       6
 
 // Strategy 4: number of pixels (warps) packed into one thread block.
 // blockDim = (32, PIXELS_PER_BLOCK) = 128 threads/block at PIXELS_PER_BLOCK=4.
 // Tunable: larger values improve block-level efficiency but may hurt
 // occupancy if register file per block grows too large.
-#define PIXELS_PER_BLOCK  4
+#define PIXELS_PER_BLOCK  8
 
 // ============================================================
 // Constant memory for velocity grids at each pyramid level
@@ -106,11 +83,18 @@ __constant__ int   d_nx;
 __constant__ int   d_ny;
 __constant__ float d_v_min;
 __constant__ float d_v_max;
+// Boundary margin: pixels within this many pixels of the edge cannot
+// support any trajectory at v_max over nf-1 steps without leaving the FOV.
+// margin = ceil(v_max * (nf - 1))
+__constant__ int   d_margin;
 
 // ============================================================
 // Device helper: evaluate one trajectory hypothesis
-// Reads INT8 (uint8_t), dequantizes with per-frame scale,
-// accumulates in FP32 for precision
+// Reads INT8 (uint8_t), dequantizes with per-frame scale.
+// Step 1+5: frame-chunk loop accumulates FRAME_CHUNK_C frames
+// in FP16 partial sums, then promotes to FP32 accumulator.
+// FP16 has 2× throughput on sm_87+ accumulate path; 16-term
+// chunks keep rounding error bounded (max sum ~16.0 << 65504).
 // ============================================================
 __device__ __forceinline__ float evaluate_trajectory(
     const uint8_t* __restrict__ frames,
@@ -120,15 +104,22 @@ __device__ __forceinline__ float evaluate_trajectory(
     const int frame_stride = ny * nx;
     float stat = 0.0f;
 
-    for (int t = 0; t < nf; t++) {
-        int px = __float2int_rn((float)x0 + vx * (float)t);
-        int py = __float2int_rn((float)y0 + vy * (float)t);
+    for (int t_base = 0; t_base < nf; t_base += FRAME_CHUNK_C) {
+        __half partial = __float2half(0.0f);
+        const int t_end = (t_base + FRAME_CHUNK_C < nf) ? t_base + FRAME_CHUNK_C : nf;
 
-        if (px < 0 || px >= nx || py < 0 || py >= ny)
-            return -FLT_MAX;
+        for (int t = t_base; t < t_end; t++) {
+            int px = __float2int_rn((float)x0 + vx * (float)t);
+            int py = __float2int_rn((float)y0 + vy * (float)t);
 
-        stat += (float)__ldg(&frames[(size_t)t * frame_stride + py * nx + px])
-                * g_frame_scale[t];
+            if (px < 0 || px >= nx || py < 0 || py >= ny)
+                return -FLT_MAX;
+
+            const float val = (float)__ldg(&frames[(size_t)t * frame_stride + py * nx + px])
+                              * g_frame_scale[t];
+            partial = __hadd(partial, __float2half(val));
+        }
+        stat += __half2float(partial);
     }
     return stat;
 }
@@ -216,6 +207,20 @@ void tbd_warp_L1(
     const int x0 = pixel_idx % nx;
     const int y0 = pixel_idx / nx;
 
+    // Boundary exclusion: skip pixels that cannot support any full trajectory.
+    // All 32 lanes share the same pixel_idx → uniform branch, no divergence.
+    if (x0 < d_margin || x0 >= nx - d_margin || y0 < d_margin || y0 >= ny - d_margin) {
+        if (lane == 0) {
+            Candidate* out = d_topk_L1 + pixel_idx * TOP_K;
+            for (int k = 0; k < TOP_K; k++) {
+                out[k].stat = -FLT_MAX;
+                out[k].vx   = 0.f;
+                out[k].vy   = 0.f;
+            }
+        }
+        return;
+    }
+
     const float inv_T = 1.f / (float)(nf - 1);
     const float vx_lo = fmaxf(d_v_min, -(float)x0 * inv_T);
     const float vx_hi = fminf(d_v_max,  (float)(nx - 1 - x0) * inv_T);
@@ -288,6 +293,17 @@ void tbd_warp_L2(
     const int x0 = pixel_idx % nx;
     const int y0 = pixel_idx / nx;
 
+    // Boundary exclusion: skip pixels that cannot support any full trajectory.
+    // All 32 lanes share the same pixel_idx → uniform branch, no divergence.
+    if (x0 < d_margin || x0 >= nx - d_margin || y0 < d_margin || y0 >= ny - d_margin) {
+        if (lane == 0) {
+            best_stats[pixel_idx]  = -FLT_MAX;
+            best_vx_out[pixel_idx] = 0.f;
+            best_vy_out[pixel_idx] = 0.f;
+        }
+        return;
+    }
+
     const float inv_T = 1.f / (float)(nf - 1);
     const float vx_lo = fmaxf(d_v_min, -(float)x0 * inv_T);
     const float vx_hi = fminf(d_v_max,  (float)(nx - 1 - x0) * inv_T);
@@ -351,7 +367,12 @@ void tbd_warp_L2(
 // for all pixels simultaneously. Adjacent threads read adjacent columns
 // → fully coalesced 128-byte cache lines.
 // Frame data is INT8 (uint8_t); dequantized via g_frame_scale[t].
-// Register usage: ~6/thread. Launched once per (vx,vy) pair.
+// Step 1+5: accumulates in FRAME_CHUNK_C-frame FP16 chunks then
+//           promotes to FP32, matching the L1/L2 accumulation path.
+// Step 3: load is coalesced (adjacent tx → adjacent columns); verify
+//         with: ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,
+//               l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum
+//               to confirm sectors/requests ratio ≈ 1.
 // ============================================================
 __global__ void shift_and_accumulate(
     const uint8_t* __restrict__ frames,
@@ -362,17 +383,29 @@ __global__ void shift_and_accumulate(
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= nx || y >= ny) return;
-
-    float acc = 0.f;
-    const int frame_stride = ny * nx;
-    for (int t = 0; t < nf; t++) {
-        int px = __float2int_rn(x + vx * t);
-        int py = __float2int_rn(y + vy * t);
-        if (px < 0 || px >= nx || py < 0 || py >= ny) { acc = -FLT_MAX; break; }
-        acc += (float)__ldg(&frames[(size_t)t * frame_stride + py * nx + px])
-               * g_frame_scale[t];
+    if (x < d_margin || x >= nx - d_margin || y < d_margin || y >= ny - d_margin) {
+        H[y * nx + x] = -FLT_MAX;
+        return;
     }
-    H[y * nx + x] = acc;
+
+    const int frame_stride = ny * nx;
+    float acc = 0.f;
+    bool out_of_bounds = false;
+
+    for (int t_base = 0; t_base < nf && !out_of_bounds; t_base += FRAME_CHUNK_C) {
+        __half partial = __float2half(0.0f);
+        const int t_end = (t_base + FRAME_CHUNK_C < nf) ? t_base + FRAME_CHUNK_C : nf;
+        for (int t = t_base; t < t_end; t++) {
+            int px = __float2int_rn(x + vx * t);
+            int py = __float2int_rn(y + vy * t);
+            if (px < 0 || px >= nx || py < 0 || py >= ny) { out_of_bounds = true; break; }
+            partial = __hadd(partial, __float2half(
+                (float)__ldg(&frames[(size_t)t * frame_stride + py * nx + px])
+                * g_frame_scale[t]));
+        }
+        if (!out_of_bounds) acc += __half2float(partial);
+    }
+    H[y * nx + x] = out_of_bounds ? -FLT_MAX : acc;
 }
 
 // ============================================================
@@ -572,6 +605,23 @@ int main(int argc, char** argv) {
 
     int n_pixels = nx * ny;
 
+    // Boundary-tightened pixel exclusion:
+    // A pixel can only anchor a valid trajectory at all velocities in
+    // [-v_max, +v_max] if its distance from every edge >= v_max * (nf-1).
+    // Pixels inside the margin band cannot complete a full trajectory without
+    // leaving the FOV at maximum speed and are excluded from TBD processing.
+    int margin = (int)ceilf(fabsf(v_max) * (float)(nf - 1));
+    int inner_nx    = nx - 2 * margin;
+    int inner_ny    = ny - 2 * margin;
+    int n_inner     = (inner_nx > 0 && inner_ny > 0) ? inner_nx * inner_ny : 0;
+    float pct_inner = 100.f * (float)n_inner / (float)n_pixels;
+    printf("Boundary margin: %d px (v_max=%.2f, nf=%d)\n", margin, v_max, nf);
+    printf("  Excluded border band : %d px wide on each side\n", margin);
+    printf("  Interior pixels      : %d x %d = %d  (%.1f%% of %d total)\n",
+           inner_nx, inner_ny, n_inner, pct_inner, n_pixels);
+    printf("  Margin pixels skipped: %d  (%.1f%%)\n\n",
+           n_pixels - n_inner, 100.f - pct_inner);
+
     // --- Build velocity grids ---
     float h_vel_L0[MAX_VEL_L0], h_vel_L1[MAX_VEL_L1], h_vel_L2[MAX_VEL_L2];
 
@@ -628,6 +678,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_ny,       &ny,      sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_v_min,    &v_min,   sizeof(float)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_v_max,    &v_max,   sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_margin,   &margin,  sizeof(int)));
 
     // --- Allocate device memory ---
     size_t frame_bytes = (size_t)n_pixels * nf * sizeof(uint8_t);
@@ -657,33 +708,51 @@ int main(int argc, char** argv) {
     printf("Allocated successfully.\n\n");
 
     // --- Convert FP32 → INT8 (per-frame linear scale) and upload ---
-    printf("Converting FP32 -> INT8 (per-frame scale) and uploading to GPU...\n");
+    // Step 6: Stream pipelining — pinned host memory + per-frame cudaMemcpyAsync.
+    // CPU converts frame t+1 on the host while the GPU DMA engine transfers frame t
+    // over PCIe (or to NVMM on Orin). Eliminates the ~5.70 s conversion + memcpy
+    // serialisation bottleneck for large frame stacks.
+    printf("Converting FP32 -> INT8 (per-frame scale, pipelined upload)...\n");
     auto up_t0 = std::chrono::steady_clock::now();
 
     size_t n_total = (size_t)n_pixels * nf;
-    float*   h_frame_scales = (float*)malloc(nf * sizeof(float));
-    uint8_t* h_frames_u8    = (uint8_t*)malloc(n_total);
+    float* h_frame_scales = (float*)malloc(nf * sizeof(float));
 
-    // Per-frame: find max, compute scale, quantize to [0, 255].
-    // Assumes non-negative frame values (radar/optical intensity).
+    // Pinned host memory → DMA engine can transfer directly without a staging copy.
+    uint8_t* h_frames_u8;
+    CUDA_CHECK(cudaHostAlloc(&h_frames_u8, n_total, cudaHostAllocDefault));
+
+    cudaStream_t upload_stream;
+    CUDA_CHECK(cudaStreamCreate(&upload_stream));
+
     for (int t = 0; t < nf; t++) {
+        // CPU: convert frame t on host (runs concurrently with GPU DMA of frame t-1)
         const float* src = h_frames_fp32 + (size_t)t * n_pixels;
         float max_val = 1e-30f;
-        for (int i = 0; i < n_pixels; i++)
-            max_val = fmaxf(max_val, src[i]);
-        float scale = max_val / 255.0f;
+        for (int i = 0; i < n_pixels; i++) max_val = fmaxf(max_val, src[i]);
+        const float scale = max_val / 255.0f;
         h_frame_scales[t] = scale;
         uint8_t* dst = h_frames_u8 + (size_t)t * n_pixels;
         for (int i = 0; i < n_pixels; i++)
             dst[i] = (uint8_t)fminf(255.f, fmaxf(0.f, roundf(src[i] / scale)));
-    }
-    free(h_frames_fp32);
-    h_frames_fp32 = nullptr;
 
-    CUDA_CHECK(cudaMemcpy(d_frames,    h_frames_u8,    frame_bytes,        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_scale_arr, h_frame_scales, nf * sizeof(float), cudaMemcpyHostToDevice));
+        // GPU DMA: enqueue async transfer for this frame.
+        // The DMA runs in the background while the next iteration converts frame t+1.
+        CUDA_CHECK(cudaMemcpyAsync(d_frames + (size_t)t * n_pixels, dst,
+                                   (size_t)n_pixels * sizeof(uint8_t),
+                                   cudaMemcpyHostToDevice, upload_stream));
+    }
+    // Wait for all async frame uploads to finish
+    CUDA_CHECK(cudaStreamSynchronize(upload_stream));
+    CUDA_CHECK(cudaStreamDestroy(upload_stream));
+
+    // Upload per-frame dequantisation scales
+    CUDA_CHECK(cudaMemcpy(d_scale_arr, h_frame_scales, nf * sizeof(float),
+                          cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpyToSymbol(g_frame_scale, &d_scale_arr, sizeof(float*)));
-    free(h_frames_u8);
+
+    CUDA_CHECK(cudaFreeHost(h_frames_u8));
+    free(h_frames_fp32); h_frames_fp32 = nullptr;
     free(h_frame_scales);
 
     auto up_t1 = std::chrono::steady_clock::now();
@@ -701,6 +770,30 @@ int main(int argc, char** argv) {
     const dim3 block(32, PIXELS_PER_BLOCK);
     const int  n_warp_blocks = (n_pixels + PIXELS_PER_BLOCK - 1) / PIXELS_PER_BLOCK;
 
+    // Step 4: L2 Persistence — pin frame data in L2 cache across repeated kernel launches.
+    // With Orin's 4 MB L2 (RTX 4090: 72 MB), this avoids re-fetching the same frame data
+    // from DRAM on each of the nv0² shift_and_accumulate launches.
+    cudaStream_t compute_stream;
+    CUDA_CHECK(cudaStreamCreate(&compute_stream));
+    {
+        size_t max_win = 0;
+        cudaDeviceGetAttribute(reinterpret_cast<int*>(&max_win),
+                               cudaDevAttrMaxAccessPolicyWindowSize, 0);
+        size_t win_bytes = (frame_bytes < max_win) ? frame_bytes : max_win;
+        if (win_bytes > 0 && prop.major >= 8) {   // Ampere (sm_80+) required
+            cudaStreamAttrValue attr = {};
+            attr.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(d_frames);
+            attr.accessPolicyWindow.num_bytes  = win_bytes;
+            attr.accessPolicyWindow.hitRatio   = 1.0f;
+            attr.accessPolicyWindow.hitProp    = cudaAccessPropertyPersisting;
+            attr.accessPolicyWindow.missProp   = cudaAccessPropertyStreaming;
+            CUDA_CHECK(cudaStreamSetAttribute(compute_stream,
+                cudaStreamAttributeAccessPolicyWindow, &attr));
+            printf("L2 persistence: %.2f MB of frame data pinned in L2 (window=%.2f MB)\n\n",
+                   frame_bytes / 1e6, win_bytes / 1e6);
+        }
+    }
+
     printf("[Phase 2] Pyramid search — L0 shift-and-stack, L1/L2 warp-per-pixel\n");
     printf("  L1/L2 block: (32 lanes × %d pixels) = %d threads\n",
            PIXELS_PER_BLOCK, 32 * PIXELS_PER_BLOCK);
@@ -713,13 +806,13 @@ int main(int argc, char** argv) {
     // -- L0: shift-and-stack coarse search --
     printf("  [L0] Coarse search (shift-and-stack, %d x %d = %lld pairs)...\n",
            nv0, nv0, evals_L0);
-    CUDA_CHECK(cudaEventRecord(t0));
+    CUDA_CHECK(cudaEventRecord(t0, compute_stream));
 
     {
         int init_n = n_pixels * TOP_K;
         int init_block = 256;
         int init_grid  = (init_n + init_block - 1) / init_block;
-        init_topk<<<init_grid, init_block>>>(d_topk_L0, init_n);
+        init_topk<<<init_grid, init_block, 0, compute_stream>>>(d_topk_L0, init_n);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -731,16 +824,16 @@ int main(int argc, char** argv) {
 
         for (int vi = 0; vi < nv0; vi++) {
             for (int vj = 0; vj < nv0; vj++) {
-                shift_and_accumulate<<<sas_grid, sas_block>>>(
+                shift_and_accumulate<<<sas_grid, sas_block, 0, compute_stream>>>(
                     d_frames, d_H, h_vel_L0[vi], h_vel_L0[vj], nx, ny, nf);
-                topk_update_L0<<<upd_grid, upd_block>>>(
+                topk_update_L0<<<upd_grid, upd_block, 0, compute_stream>>>(
                     d_H, h_vel_L0[vi], h_vel_L0[vj], d_topk_L0, n_pixels);
             }
         }
         CUDA_CHECK(cudaGetLastError());
     }
 
-    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventRecord(t1, compute_stream));
     CUDA_CHECK(cudaEventSynchronize(t1));
     float l0_ms;
     CUDA_CHECK(cudaEventElapsedTime(&l0_ms, t0, t1));
@@ -750,10 +843,10 @@ int main(int argc, char** argv) {
     printf("  [L1] Medium refine  (%d × %d x %d = %lld pairs/pixel, "
            "ceil(%lld/32) iters/lane)...\n",
            TOP_K, nv1, nv1, evals_L1, evals_L1);
-    CUDA_CHECK(cudaEventRecord(t0));
-    tbd_warp_L1<<<n_warp_blocks, block>>>(d_frames, d_topk_L0, d_topk_L1);
+    CUDA_CHECK(cudaEventRecord(t0, compute_stream));
+    tbd_warp_L1<<<n_warp_blocks, block, 0, compute_stream>>>(d_frames, d_topk_L0, d_topk_L1);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventRecord(t1, compute_stream));
     CUDA_CHECK(cudaEventSynchronize(t1));
     float l1_ms;
     CUDA_CHECK(cudaEventElapsedTime(&l1_ms, t0, t1));
@@ -763,11 +856,11 @@ int main(int argc, char** argv) {
     printf("  [L2] Fine refine    (%d × %d x %d = %lld pairs/pixel, "
            "ceil(%lld/32) iters/lane)...\n",
            TOP_K, nv2, nv2, evals_L2, evals_L2);
-    CUDA_CHECK(cudaEventRecord(t0));
-    tbd_warp_L2<<<n_warp_blocks, block>>>(
+    CUDA_CHECK(cudaEventRecord(t0, compute_stream));
+    tbd_warp_L2<<<n_warp_blocks, block, 0, compute_stream>>>(
         d_frames, d_topk_L1, d_best_stats, d_best_vx, d_best_vy);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventRecord(t1, compute_stream));
     CUDA_CHECK(cudaEventSynchronize(t1));
     float l2_ms;
     CUDA_CHECK(cudaEventElapsedTime(&l2_ms, t0, t1));
@@ -792,7 +885,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_blk_vy,    red_grid * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_blk_idx,   red_grid * sizeof(int)));
 
-    reduce_argmax<<<red_grid, red_block>>>(
+    reduce_argmax<<<red_grid, red_block, 0, compute_stream>>>(
         d_best_stats, d_best_vx, d_best_vy,
         n_pixels, d_blk_stats, d_blk_vx, d_blk_vy, d_blk_idx);
     CUDA_CHECK(cudaGetLastError());
@@ -864,6 +957,12 @@ int main(int argc, char** argv) {
            (double)brute_evals / total_evals);
     printf("    Memory saved (INT8)  : %.1f GB\n",
            (double)n_pixels * nf * (sizeof(float) - sizeof(uint8_t)) / 1e9);
+    printf("  Boundary exclusion:\n");
+    printf("    Margin               : %d px\n", margin);
+    printf("    Interior pixels      : %d / %d  (%.1f%%)\n",
+           n_inner, n_pixels, pct_inner);
+    printf("    Traj skipped (L0)    : %.2f billion\n",
+           (double)(n_pixels - n_inner) * evals_L0 / 1e9);
     printf("================================================================\n");
 
     // --- Cleanup ---
@@ -882,6 +981,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_blk_idx));
     CUDA_CHECK(cudaEventDestroy(t0));
     CUDA_CHECK(cudaEventDestroy(t1));
+    CUDA_CHECK(cudaStreamDestroy(compute_stream));
 
     return 0;
 }

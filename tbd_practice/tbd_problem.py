@@ -76,13 +76,13 @@ OBJ_SIGNAL = 14.0           # Object signal added per frame (photons)
 # Ground truth trajectory — auto-computed from current parameters (see below)
 
 # Velocity search grid
-V_HYP = 155               # Corresponds to 24025 velocity hypothesis
+V_HYP = 155               # Number of velocity hypotheses per axis (total V_HYP^2 pairs)
 V_MIN  = -3.0               # Min velocity (pixels/frame)
 V_MAX  =  3.0               # Max velocity (pixels/frame)
 V_STEP = (V_MAX - V_MIN) / (V_HYP - 1)  # Velocity step size
 SEED   = 42                 # RNG seed for reproducibility
 NUMPY_COMPUTE = False        # Run NumPy vectorized reference search (set False to skip)
-VX_VY_RATIO   = 2.0         # Desired ratio of vx / |vy| for the ground truth trajectory
+VX_VY_RATIO   = 1.5         # Desired ratio of vx / |vy| for the ground truth trajectory
 
 
 # ============================================================
