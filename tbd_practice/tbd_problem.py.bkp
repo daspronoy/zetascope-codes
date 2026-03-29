@@ -73,9 +73,7 @@ OBJ_SIGNAL = 14.0           # Object signal added per frame (photons)
                              # Stacked SNR  ~ per_frame_SNR * sqrt(N_FRAMES)
 
 
-# Ground truth velocity — set manually or leave as None to auto-compute
-TRUE_VX = 0.73              # px/frame, positive = rightward  (None = auto)
-TRUE_VY = -0.47              # px/frame, positive = downward   (None = auto)
+# Ground truth trajectory — auto-computed from current parameters (see below)
 
 # Velocity search grid
 V_HYP = 155               # Number of velocity hypotheses per axis (total V_HYP^2 pairs)
@@ -84,7 +82,7 @@ V_MAX  =  3.0               # Max velocity (pixels/frame)
 V_STEP = (V_MAX - V_MIN) / (V_HYP - 1)  # Velocity step size
 SEED   = 42                 # RNG seed for reproducibility
 NUMPY_COMPUTE = False        # Run NumPy vectorized reference search (set False to skip)
-VX_VY_RATIO   = 1.5         # Desired ratio of vx / |vy| for the ground truth trajectory (auto mode only)
+VX_VY_RATIO   = 1.5         # Desired ratio of vx / |vy| for the ground truth trajectory
 
 
 # ============================================================
@@ -92,37 +90,19 @@ VX_VY_RATIO   = 1.5         # Desired ratio of vx / |vy| for the ground truth tr
 # ============================================================
 def compute_ground_truth():
     """
-    Determine the ground truth trajectory.
-
-    If TRUE_VX / TRUE_VY are set at the top of this file, those values are used
-    directly and only the starting position is computed.  A ValueError is raised
-    if the requested velocity would take the object outside the image.
-
-    Otherwise velocities are auto-selected to use ~1/3 of the image in each
-    axis at a ratio of VX_VY_RATIO, snapped to V_STEP.
-    Starting position is centred in the valid range.
+    Pick a ground truth trajectory that:
+      - keeps the object inside [0, NX-1] x [0, NY-1] for all N_FRAMES
+      - uses a fixed 0.25 px/frame grid so values are always clean round numbers,
+        independent of V_HYP
+    Starting position is centered in the valid range.
     """
+    GT_STEP = V_STEP
+    velocities = np.arange(V_MIN, V_MAX + GT_STEP / 2, GT_STEP)
+
     def valid_start_range(v, n_frames, n_pixels):
         """Return (lo, hi) of valid starting indices for velocity v."""
         end_disp = int(round(v * (n_frames - 1)))
         return (0, n_pixels - 1 - end_disp) if v >= 0 else (-end_disp, n_pixels - 1)
-
-    if TRUE_VX is not None and TRUE_VY is not None:
-        vx, vy = float(TRUE_VX), float(TRUE_VY)
-        lox, hix = valid_start_range(vx, N_FRAMES, NX)
-        loy, hiy = valid_start_range(vy, N_FRAMES, NY)
-        if lox > hix or loy > hiy:
-            raise ValueError(
-                f"TRUE_VX={vx}, TRUE_VY={vy} takes the object outside the image "
-                f"for N_FRAMES={N_FRAMES}. Reduce |vx| or |vy|."
-            )
-        x0 = float((lox + hix) // 2)
-        y0 = float((loy + hiy) // 2)
-        return x0, y0, vx, vy
-
-    # --- auto mode ---
-    GT_STEP = V_STEP
-    velocities = np.arange(V_MIN, V_MAX + GT_STEP / 2, GT_STEP)
 
     valid_vx = [v for v in velocities
                 if valid_start_range(v, N_FRAMES, NX)[0] <= valid_start_range(v, N_FRAMES, NX)[1]]

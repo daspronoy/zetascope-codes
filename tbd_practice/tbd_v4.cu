@@ -32,6 +32,16 @@
 #define REPORT_EVERY 1000
 
 // ============================================================
+// Velocity search grid (independent of data generation)
+// Matches tbd_problem.py: V_MIN=-3.0, V_MAX=3.0, V_HYP=155
+// V_STEP = (V_MAX - V_MIN) / (V_HYP - 1) = 6.0 / 154
+// ============================================================
+#define SEARCH_V_MIN   (-3.0f)
+#define SEARCH_V_MAX   ( 3.0f)
+#define SEARCH_V_HYP   155
+#define SEARCH_V_STEP  ((SEARCH_V_MAX - SEARCH_V_MIN) / (float)(SEARCH_V_HYP - 1))
+
+// ============================================================
 // Constant memory: image geometry + border margin
 // ============================================================
 __constant__ int d_nx;
@@ -221,26 +231,6 @@ float* load_frames(const char* filename, int* nx, int* ny, int* nf)
     return data;
 }
 
-// ============================================================
-// Host: load velocity search parameters
-// 3 × float32: (v_min, v_max, v_step)
-// ============================================================
-void load_params(const char* filename,
-                 float* v_min, float* v_max, float* v_step, int* n_vel)
-{
-    FILE* f = fopen(filename, "rb");
-    if (!f) { fprintf(stderr, "Cannot open %s\n", filename); exit(1); }
-
-    float params[3];
-    if (fread(params, sizeof(float), 3, f) != 3) {
-        fprintf(stderr, "Failed to read params\n"); exit(1);
-    }
-    *v_min  = params[0];
-    *v_max  = params[1];
-    *v_step = params[2];
-    *n_vel  = (int)roundf((*v_max - *v_min) / *v_step) + 1;
-    fclose(f);
-}
 
 // ============================================================
 // Host: quantise FP32 frames → uint8_t with per-frame scale
@@ -291,7 +281,6 @@ void quantise_frames(
 int main(int argc, char** argv)
 {
     const char* frame_file = (argc > 1) ? argv[1] : "tbd_frames.bin";
-    const char* param_file = (argc > 2) ? argv[2] : "tbd_params.bin";
 
     printf("================================================================\n");
     printf("  TBD Brute-Force — INT8 Shift-and-Stack\n");
@@ -316,9 +305,10 @@ int main(int argc, char** argv)
     printf("    Frames : %d x %d x %d  (%.2f GB FP32)\n",
            nx, ny, nf, (double)nx * ny * nf * 4 / 1e9);
 
-    float v_min, v_max, v_step;
-    int   n_vel;
-    load_params(param_file, &v_min, &v_max, &v_step, &n_vel);
+    const float v_min  = SEARCH_V_MIN;
+    const float v_max  = SEARCH_V_MAX;
+    const float v_step = SEARCH_V_STEP;
+    const int   n_vel  = SEARCH_V_HYP;
     printf("    Vel    : v_min=%.4f  v_max=%.4f  step=%.6f  n_vel=%d\n\n",
            v_min, v_max, v_step, n_vel);
 
