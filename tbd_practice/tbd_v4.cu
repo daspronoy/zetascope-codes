@@ -38,7 +38,7 @@
 // ============================================================
 #define SEARCH_V_MIN   (-3.0f)
 #define SEARCH_V_MAX   ( 3.0f)
-#define SEARCH_V_HYP   155
+#define SEARCH_V_HYP   300
 #define SEARCH_V_STEP  ((SEARCH_V_MAX - SEARCH_V_MIN) / (float)(SEARCH_V_HYP - 1))
 
 // ============================================================
